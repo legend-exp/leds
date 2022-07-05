@@ -1,0 +1,20 @@
+leds package
+============
+
+.. automodule:: leds
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :private-members:
+
+Submodules
+----------
+
+leds.core module
+----------------
+
+.. automodule:: leds.core
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :private-members:
