@@ -469,7 +469,7 @@ class EventViewer:
         # Single evt/geds row read gives the fired detectors, their energies and
         # the index back into each channel's raw/hit table (for waveforms).
         names = [
-            n.decode() if isinstance(n, (bytes, bytearray)) else n
+            n.decode() if isinstance(n, bytes | bytearray) else n
             for n in self._read_row(file, "detector_name", local)
         ]
         values = self._read_row(file, self.energy_field, local)
@@ -562,9 +562,11 @@ class EventViewer:
         ]
         values = np.array(
             [
-                v
-                if (v := self.energy_dict.get(channel_map[r]["name"])) is not None
-                else np.nan
+                (
+                    v
+                    if (v := self.energy_dict.get(channel_map[r]["name"])) is not None
+                    else np.nan
+                )
                 for r in rawids
             ],
             dtype=float,

@@ -10,7 +10,7 @@ def _bound_factory(base_path):
     A plain closure (not ``functools.partial``) so Panel recognises it as a
     session factory and calls it per connection instead of rendering its repr.
     """
-    from leds.app import create_app  # (lazy: keep panel off CLI startup)
+    from leds.app import create_app  # noqa: PLC0415 (lazy: keep panel off startup)
 
     def factory():
         return create_app(base_path)
@@ -28,7 +28,7 @@ def _free_port():
 
 def _serve(args):
     """Long-running, multi-user hosted instance (Docker / NERSC spin)."""
-    import panel as pn  # (lazy: keep panel off CLI startup)
+    import panel as pn  # noqa: PLC0415 (lazy: keep panel off CLI startup)
 
     pn.serve(
         _bound_factory(args.base_path),
@@ -42,12 +42,12 @@ def _serve(args):
 
 def _app(args):
     """Local single-user instance: a browser tab, or a native window."""
-    import panel as pn  # (lazy: keep panel off CLI startup)
+    import panel as pn  # noqa: PLC0415 (lazy: keep panel off CLI startup)
 
     factory = _bound_factory(args.base_path)
 
     if args.desktop:
-        import webview  # (optional dep, imported only when needed)
+        import webview  # noqa: PLC0415 (optional dep, imported only when needed)
 
         port = args.port or _free_port()
         pn.serve(factory, port=port, show=False, threaded=True)

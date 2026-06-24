@@ -38,7 +38,7 @@ SUMMARY = (
 
 def _to_py(value):
     """Bytes -> str, recursively (for nested per-hit lists)."""
-    if isinstance(value, (bytes, bytearray)):
+    if isinstance(value, bytes | bytearray):
         return value.decode()
     if isinstance(value, list):
         return [_to_py(v) for v in value]
@@ -49,7 +49,7 @@ def _flatten(obj, rows, prefix=""):
     for key in obj:
         child = obj[key]
         name = prefix + key
-        if isinstance(child, (lgdo.Table, lgdo.Struct)):
+        if isinstance(child, lgdo.Table | lgdo.Struct):
             _flatten(child, rows, name + ".")
         elif isinstance(child, lgdo.Array):
             rows.append((name, _to_py(child.nda[0])))
