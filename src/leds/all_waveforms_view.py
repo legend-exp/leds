@@ -3,9 +3,10 @@
 ``system`` selects the detector system (geds / spms). ``grouping`` partitions
 that system (see ``leds.event_viewer.SYSTEM_GROUPINGS``: geds by
 String/HV filter/CC4, spms by barrel). ``category`` then picks the subset:
-  * ``"all"`` — every channel of the system,
-  * ``"above threshold"`` — geds channels above ``ABOVE_THRESHOLD`` (geds only),
-  * a specific group label (e.g. ``"String:01"``, ``"IB"``).
+
+* ``"all"`` — every channel of the system,
+* ``"above threshold"`` — geds channels above ``ABOVE_THRESHOLD`` (geds only),
+* a specific group label (e.g. ``"String:01"``, ``"IB"``).
 
 Views: *compressed* (one figure, traces overlaid + per-group/detector legend
 with ``click_policy="hide"``) or *exploded* (a grid of subplots).
