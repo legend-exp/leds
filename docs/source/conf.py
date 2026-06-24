@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import sys
+from importlib.metadata import version as _version
 from pathlib import Path
-
-from pkg_resources import get_distribution
 
 sys.path.insert(0, Path(__file__).parents[2].resolve().as_posix())
 
 project = "leds"
 copyright = "Copyright Holder"
-version = get_distribution("leds").version
+version = _version("leds")
 
 extensions = [
     "sphinx.ext.githubpages",
