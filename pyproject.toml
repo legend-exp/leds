@@ -11,7 +11,7 @@ authors = [
 ]
 description = "LEGEND Event Display"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 classifiers = [
   "Development Status :: 1 - Planning",
   "Intended Audience :: Science/Research",
@@ -21,9 +21,6 @@ classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering",
@@ -31,19 +28,30 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-  "pygama",
-  "pyqtgraph",
-  "pyqt5",
+  "panel>=1.0.2",
+  "param>=1.13.0",
+  "bokeh>=3.1.1",
+  "matplotlib",
+  "numpy",
   "boost-histogram",
-  "pylegendmeta"
+  "dbetto>=1.2.3",
+  "pylegendmeta>=1.2.5",
+  "pygama",
+  "dspeed",
+  "legend-pydataobj",
+  "legend-lh5io",
 ]
 
 [project.scripts]
-leds = "leds.cli:leds_cli"
+leds = "leds.cli:main"
 
 [project.optional-dependencies]
 all = [
-  "leds[docs,test]"
+  "leds[docs,test,desktop]"
+]
+desktop = [
+  # native-window launcher for the local GUI mode (`leds app --desktop`)
+  "pywebview",
 ]
 test = [
   "pre-commit",
@@ -66,6 +74,10 @@ Changelog = "https://github.com/legend-exp/leds/releases"
 
 [tool.setuptools_scm]
 write_to = "src/leds/_version.py"
+
+
+[tool.setuptools.package-data]
+leds = ["logos/*"]
 
 
 [tool.pytest.ini_options]
@@ -91,7 +103,7 @@ port.exclude_lines = [
 
 [tool.mypy]
 files = ["src", "tests"]
-python_version = "3.8"
+python_version = "3.11"
 warn_unused_configs = true
 strict = true
 show_error_codes = true
@@ -141,7 +153,7 @@ unfixable = [
   "T20",  # Removes print statements
   "F841", # Removes unused variables
 ]
-exclude = []
+exclude = ["_archive"]
 flake8-unused-arguments.ignore-variadic-names = true
 isort.required-imports = ["from __future__ import annotations"]
 
@@ -151,7 +163,7 @@ isort.required-imports = ["from __future__ import annotations"]
 
 
 [tool.pylint]
-py-version = "3.8"
+py-version = "3.11"
 ignore-paths = [".*/_version.py"]
 reports.output-format = "colorized"
 similarities.ignore-imports = "yes"
