@@ -9,9 +9,9 @@ the move to the `evt` tier, the `dataflow-config.yaml` config format, and the
 The live application is the Panel/Bokeh dashboard under `src/leds/`
 (`leds serve` / `leds app`).
 
-| file | what it was |
-|------|-------------|
-| `core.py` | PyQt5 `MainWindow` event display |
-| `waveform_browse.py` | PyQt5 + dspeed waveform browser (matplotlib `pick_event`) |
-| `layouts/*.ui` | Qt Designer UI files loaded via `uic` |
-| `utils.py` | old `config.json`-based `sorter` (superseded by channelmap logic) |
+| file                 | what it was                                                       |
+| -------------------- | ----------------------------------------------------------------- |
+| `core.py`            | PyQt5 `MainWindow` event display                                  |
+| `waveform_browse.py` | PyQt5 + dspeed waveform browser (matplotlib `pick_event`)         |
+| `layouts/*.ui`       | Qt Designer UI files loaded via `uic`                             |
+| `utils.py`           | old `config.json`-based `sorter` (superseded by channelmap logic) |
