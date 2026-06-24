@@ -48,10 +48,10 @@ class RunSpectrum:
         key = (period, run)
         if key not in self._cache:
             files = [str(f) for f in self.viewer._run_files(period, run)]
-            tier = self.viewer.tier  # "evt" or "pet"
+            group = self.viewer.group  # in-file group ("evt"), not the file tier
 
             def col(field):
-                return lh5.read(f"{tier}/{field}", files)
+                return lh5.read(f"{group}/{field}", files)
 
             self._cache[key] = {
                 "energy": col("geds/energy").view_as("ak"),

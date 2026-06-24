@@ -59,7 +59,7 @@ def _flatten(obj, rows, prefix=""):
 
 def _read_field(ev, table, path):
     obj = lh5.read(
-        f"{ev.tier}/{table}/{path.replace('.', '/')}",
+        f"{ev.group}/{table}/{path.replace('.', '/')}",
         str(ev.current_file),
         start_row=ev.index,
         n_rows=1,
@@ -90,7 +90,7 @@ def summary_dataframe(ev):
 def table_dataframe(ev, table):
     """``field | value`` DataFrame for one evt table at the current event."""
     obj = lh5.read(
-        f"{ev.tier}/{table}", str(ev.current_file), start_row=ev.index, n_rows=1
+        f"{ev.group}/{table}", str(ev.current_file), start_row=ev.index, n_rows=1
     )
     rows: list = []
     _flatten(obj, rows)
