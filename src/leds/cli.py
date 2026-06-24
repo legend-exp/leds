@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
+import sys
 
 
 def _bound_factory(base_path):
@@ -30,14 +32,32 @@ def _serve(args):
     """Long-running, multi-user hosted instance (Docker / NERSC spin)."""
     import panel as pn  # noqa: PLC0415 (lazy: keep panel off CLI startup)
 
-    pn.serve(
-        _bound_factory(args.base_path),
-        address=args.address,
-        port=args.port,
-        websocket_origin=args.allow_websocket_origin or None,
-        num_procs=args.num_procs,
-        show=False,
-    )
+    serve_kwargs = {
+        "address": args.address,
+        "port": args.port,
+        "websocket_origin": args.allow_websocket_origin or None,
+        "num_procs": args.num_procs,
+        "show": False,
+    }
+
+    # Optional login page. ``basic_auth`` is either a shared password or a path
+    # to a JSON file of {username: password}; both are typically injected by
+    # NERSC Spin as a secret (env var or mounted file).
+    if args.basic_auth:
+        import secrets  # noqa: PLC0415 (only needed when auth is enabled)
+
+        cookie_secret = args.cookie_secret or secrets.token_hex(32)
+        if not args.cookie_secret:
+            print(  # noqa: T201 (intentional operator-facing CLI warning)
+                "leds: no --cookie-secret/$LEDS_COOKIE_SECRET set; using an "
+                "ephemeral one. Provide a fixed secret so logins survive "
+                "restarts and are shared across replicas.",
+                file=sys.stderr,
+            )
+        serve_kwargs["basic_auth"] = args.basic_auth
+        serve_kwargs["cookie_secret"] = cookie_secret
+
+    pn.serve(_bound_factory(args.base_path), **serve_kwargs)
 
 
 def _app(args):
@@ -83,6 +103,18 @@ def main(argv=None):
         "--allow-websocket-origin",
         action="append",
         help="host[:port] allowed to connect (repeatable)",
+    )
+    serve.add_argument(
+        "--basic-auth",
+        default=os.environ.get("LEDS_BASIC_AUTH"),
+        help="enable a login page; a shared password or a path to a JSON file "
+        "of {username: password} (default $LEDS_BASIC_AUTH)",
+    )
+    serve.add_argument(
+        "--cookie-secret",
+        default=os.environ.get("LEDS_COOKIE_SECRET"),
+        help="secret used to sign the auth cookie; use a fixed value across "
+        "restarts/replicas (default $LEDS_COOKIE_SECRET)",
     )
     serve.set_defaults(func=_serve)
 
