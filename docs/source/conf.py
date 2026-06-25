@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import sys
+from importlib.metadata import version as _version
 from pathlib import Path
-
-from pkg_resources import get_distribution
 
 sys.path.insert(0, Path(__file__).parents[2].resolve().as_posix())
 
 project = "leds"
 copyright = "Copyright Holder"
-version = get_distribution("leds").version
+version = _version("leds")
 
 extensions = [
     "sphinx.ext.githubpages",
@@ -38,17 +37,24 @@ html_theme_options = {
 }
 html_title = f"{project} {version}"
 
-# list here legend-optics dependencies that are not required for building docs and
-# could be unmet at build time
+# Heavy/scientific dependencies mocked at doc-build time: autodoc only needs to
+# read leds' own signatures and docstrings, and importing these for real pulls
+# in the lgdo -> awkward-pandas -> pandas chain, which can be mutually
+# incompatible in the slim docs environment.
 autodoc_mock_imports = [
-    "pandas",
-    # 'numpy',
+    "awkward",
+    "awkward_pandas",
+    "bokeh",
+    "dbetto",
+    "dspeed",
+    "legendmeta",
+    "lgdo",
+    "lh5",
     "matplotlib",
     "mplhep",
+    "pandas",
+    "panel",
     "scipy",
-    "scimath",
-    "pytest",
-    "pint",
 ]  # add new packages here
 autodoc_default_options = {"ignore-module-all": True}
 
@@ -61,10 +67,9 @@ napoleon_use_ivar = True
 # intersphinx
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
-    "numpy": ("http://docs.scipy.org/doc/numpy", None),
-    "scipy": ("http://docs.scipy.org/doc/scipy/reference", None),
+    "numpy": ("https://numpy.org/doc/stable", None),
     "pandas": ("https://pandas.pydata.org/docs", None),
-    "matplotlib": ("http://matplotlib.org/stable", None),
+    "matplotlib": ("https://matplotlib.org/stable", None),
 }  # add new intersphinx mappings here
 
 # sphinx-autodoc
