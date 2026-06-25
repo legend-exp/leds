@@ -89,9 +89,11 @@ def main(argv=None):
     def add_base_path(p):
         p.add_argument(
             "base_path",
-            nargs="?",
+            nargs="*",
             default=None,
-            help="production cycle directory (defaults to $LEDS_BASE_PATH)",
+            help="one or more directories to search for production cycles "
+            "(defaults to $LEDS_BASE_PATH, which may list several separated "
+            "by the path separator)",
         )
 
     serve = sub.add_parser("serve", help="run the hosted multi-user server")
