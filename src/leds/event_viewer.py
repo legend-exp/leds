@@ -252,7 +252,13 @@ class EventViewer:
         self.tier = self._resolve_tier("pet", "evt")
         self.hit_tier = self._resolve_tier("pht", "hit", required=False)
         self.dsp_tier = self._resolve_tier("psp", "dsp", required=False)
-        self.geds_group = f"{self.tier}/geds"
+        # in-file LH5 groups keep the base product name (evt/hit/dsp) even when
+        # the files live in the partitioned tier (pet/pht/psp), so reads must be
+        # prefixed with the group, not the file tier.
+        self.group = "evt"
+        self.hit_group = "hit" if self.hit_tier else None
+        self.dsp_group = "dsp" if self.dsp_tier else None
+        self.geds_group = f"{self.group}/geds"
 
         self.meta = LegendMetadata(str(self.paths.metadata), lazy=True)
         self.status_db = LegendMetadata(str(self.paths.detector_status), lazy=True)
@@ -392,7 +398,7 @@ class EventViewer:
         tstamp = self._narrow(tstamps, _tstamp_to_unix, target)
         file = self._evt_file(period, run, tstamp)
 
-        times = lh5.read(f"{self.tier}/trigger/timestamp", str(file)).nda
+        times = lh5.read(f"{self.group}/trigger/timestamp", str(file)).nda
         local = int(np.searchsorted(times, target))
         if local >= len(times):
             local = len(times) - 1
@@ -453,7 +459,7 @@ class EventViewer:
         self.tstamp = file.name.split("-")[4]
         self.event_timestamp = float(
             lh5.read(
-                f"{self.tier}/trigger/timestamp", str(file), start_row=local, n_rows=1
+                f"{self.group}/trigger/timestamp", str(file), start_row=local, n_rows=1
             ).nda[0]
         )
         self.chmap = self.meta.channelmap(self.tstamp)
@@ -497,11 +503,11 @@ class EventViewer:
         # SiPMs: per channel, sum the energy of its triggered coincident pulses
         # (evt/spms/energy and is_trig_coin_pulse are nested per pulse).
         self._status = self._status_for(self.tstamp)
-        spm_rawids = self._read_row(file, "rawid", local, group=f"{self.tier}/spms")
+        spm_rawids = self._read_row(file, "rawid", local, group=f"{self.group}/spms")
         spm_trig = self._read_row(
-            file, "is_trig_coin_pulse", local, group=f"{self.tier}/spms"
+            file, "is_trig_coin_pulse", local, group=f"{self.group}/spms"
         )
-        spm_energy = self._read_row(file, "energy", local, group=f"{self.tier}/spms")
+        spm_energy = self._read_row(file, "energy", local, group=f"{self.group}/spms")
         self.spms_energy = {}
         for rawid, pulses, pulse_energy in zip(
             spm_rawids, spm_trig, spm_energy, strict=True

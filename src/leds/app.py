@@ -18,7 +18,7 @@ from leds.all_waveforms_view import (
     y_axis_label,
 )
 from leds.array_view import build_source_data, empty_source, make_event_figure
-from leds.config import list_cycles, resolve_base_path
+from leds.config import discover_cycles, resolve_base_paths
 from leds.event_viewer import EventViewer, parse_timestamp
 from leds.spectrum import (
     BINARY_CUTS,
@@ -124,13 +124,13 @@ class EventDisplay(param.Parameterized):
     cut_multiplicity = param.Selector(default="off", objects=list(MULT_OPTIONS))
 
     def __init__(self, base_path=None, **params):
-        self.root = resolve_base_path(base_path)
-        cycles = list_cycles(self.root)
-        if cycles:
-            self._cycle_paths = {c: self.root / c for c in cycles}
-        else:  # the path itself is a single production cycle
-            self._cycle_paths = {self.root.name: self.root}
-            cycles = [self.root.name]
+        self.roots = resolve_base_paths(base_path)
+        self._cycle_paths = discover_cycles(self.roots)
+        if not self._cycle_paths:
+            # no dataflow-config found under any root; expose the roots anyway so
+            # the load error is shown in-app rather than crashing at startup
+            self._cycle_paths = {r.name: r for r in self.roots}
+        cycles = list(self._cycle_paths)
         self.param.production_cycle.objects = cycles
         params.setdefault("production_cycle", cycles[0])
 
