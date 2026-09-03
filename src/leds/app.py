@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.resources
 import threading
+import traceback
 from contextlib import contextmanager
 from functools import partial, wraps
 
@@ -287,7 +288,7 @@ class EventDisplay(param.Parameterized):
         self.exploded_toggle = pn.widgets.Toggle.from_param(
             self.param.all_wf_exploded, name="Exploded", width=110
         )
-        all_wf_tab = pn.Column(
+        self.all_wf_tab = pn.Column(
             pn.Row(
                 pn.widgets.Select.from_param(
                     self.param.all_wf_system, name="System", width=110
@@ -374,7 +375,7 @@ class EventDisplay(param.Parameterized):
         self.dataset_datatype_select = pn.widgets.Select.from_param(
             self.param.dataset_datatype, name="Datatype", width=90
         )
-        dataset_tab = pn.Column(
+        self.dataset_tab = pn.Column(
             pn.Row(
                 pn.widgets.Select.from_param(
                     self.param.dataset_plot, name="Show", width=140
@@ -402,7 +403,7 @@ class EventDisplay(param.Parameterized):
         self.validation_detector_select = pn.widgets.Select.from_param(
             self.param.validation_detector, name="Detector", width=120, visible=False
         )
-        validation_tab = pn.Column(
+        self.validation_tab = pn.Column(
             pn.Row(
                 pn.widgets.Select.from_param(
                     self.param.validation_plot, name="Show", width=170
@@ -421,11 +422,18 @@ class EventDisplay(param.Parameterized):
         self.tabs = pn.Tabs(
             ("Event display", self.main_row),
             ("Event details", details_tab),
-            ("All waveforms", all_wf_tab),
+            ("All waveforms", self.all_wf_tab),
             ("Spectrum", spectrum_tab),
-            ("Dataset", dataset_tab),
-            ("Validation", validation_tab),
-            dynamic=True,
+            ("Dataset", self.dataset_tab),
+            ("Validation", self.validation_tab),
+            # static, not dynamic: every tab stays mounted and switching is
+            # purely client-side. Dynamic tabs re-render the child on the
+            # server for every switch, and rapid back-and-forth on a slow
+            # deployment left the returning tab's plot blank. The tabs'
+            # content is still built lazily -- each updater gates on the
+            # active tab -- and a build that finishes after the user has moved
+            # on lands in the (mounted) hidden tab, ready for their return.
+            dynamic=False,
         )
 
         self.tabs.param.watch(self._on_tab, "active")
@@ -526,12 +534,32 @@ class EventDisplay(param.Parameterized):
     @_serialized
     def _on_tab(self, _event):
         # each updater self-gates on the active tab and on whether anything
-        # it draws has actually changed, so this is one rebuild at most
-        self._update_all_waveforms()
-        self._update_run_spectrum()
-        self._update_event_details()
-        self._update_dataset()
-        self._update_validation()
+        # it draws has actually changed, so this is one rebuild at most; each
+        # runs on its own so one tab's failure cannot leave another half-drawn
+        for label, update in (
+            ("all waveforms", self._update_all_waveforms),
+            ("spectrum", self._update_run_spectrum),
+            ("event details", self._update_event_details),
+            ("dataset", self._update_dataset),
+            ("validation", self._update_validation),
+        ):
+            self._guarded(label, update)
+
+    def _guarded(self, label, update):
+        """Run one tab updater; an unexpected failure becomes a message.
+
+        The updaters already turn the errors they expect (missing files, bad
+        keys) into the Alert. Anything else used to propagate out of the tab
+        watcher, aborting it half-way through Panel's own tab switch, which is
+        how a tab can end up with its controls but no plot. Show it instead,
+        and print the traceback so the container log has it.
+        """
+        try:
+            update()
+        except Exception as exc:
+            traceback.print_exc()
+            self.message.object = f"**{label}:** {type(exc).__name__}: {exc}"
+            self.message.visible = True
 
     @_serialized
     def _on_clear(self, _event):
@@ -965,19 +993,23 @@ class EventDisplay(param.Parameterized):
         # a new event only refreshes the existing figure's data; the figure
         # (and the pane showing it) is replaced only when the layout changed,
         # so the browser keeps its renderers and its zoom
-        rebuilt = self._all_wf_figure.update(
-            self.viewer,
-            system=self.all_wf_system,
-            grouping=self.all_wf_grouping,
-            category=self.all_wf_category,
-            exploded=self.all_wf_exploded,
-            param=self.waveform_param,
-            processor=self.processor,
-            subtract_baseline=self.subtract_baseline,
-            kind=self.all_wf_kind,
-            apply=self._on_loop,
-        )
-        if rebuilt:
+        self.all_wf_tab.loading = True
+        try:
+            rebuilt = self._all_wf_figure.update(
+                self.viewer,
+                system=self.all_wf_system,
+                grouping=self.all_wf_grouping,
+                category=self.all_wf_category,
+                exploded=self.all_wf_exploded,
+                param=self.waveform_param,
+                processor=self.processor,
+                subtract_baseline=self.subtract_baseline,
+                kind=self.all_wf_kind,
+                apply=self._on_loop,
+            )
+        finally:
+            self.all_wf_tab.loading = False
+        if rebuilt or self.all_wf_pane.object is not self._all_wf_figure.root:
             self.all_wf_pane.object = self._all_wf_figure.root
             # exploded subplots drop their y label in favour of one shared
             # label on the left; the compressed single figure keeps its own
@@ -1003,6 +1035,7 @@ class EventDisplay(param.Parameterized):
             return  # already on screen; re-assigning re-serialises the figure
         fig = self._dataset_figs.get(key)
         if fig is None:
+            self.dataset_tab.loading = True
             try:
                 fig, source = dataset_view.dataset_figure(
                     self.viewer, plot=self.dataset_plot, datatype=self.dataset_datatype
@@ -1011,12 +1044,17 @@ class EventDisplay(param.Parameterized):
                 self.message.object = f"**dataset view:** {type(exc).__name__}: {exc}"
                 self.message.visible = True
                 return
+            finally:
+                self.dataset_tab.loading = False
             # tap a cell/bar -> jump the event display to that run (handler
             # attached once per built figure; the cache prevents duplicates)
             source.selected.on_change(
                 "indices", lambda _a, _o, new, s=source: self._on_dataset_tap(s, new)
             )
             self._dataset_figs[key] = fig
+        # the user may have moved on while this built (under nthreads the tab
+        # switch runs on another thread); the tab stays mounted, so the figure
+        # is shown there and is ready when they return
         if fig is not self.dataset_pane.object:  # see _update_validation
             self.dataset_pane.object = fig
         self._tab_drawn(TAB_DATASET, (self.production_cycle, key))
@@ -1060,12 +1098,15 @@ class EventDisplay(param.Parameterized):
             self._refresh_validation_strings()
         if self._tab_is_current(TAB_VALIDATION, self._validation_state()):
             return
+        self.validation_tab.loading = True
         try:
             fig = self._validation_figure(plot)
         except (KeyError, ValueError, FileNotFoundError, OSError) as exc:
             self.message.object = f"**validation:** {type(exc).__name__}: {exc}"
             self.message.visible = True
             return
+        finally:
+            self.validation_tab.loading = False
         if fig is not None:
             # never re-assign the figure already on screen: param treats any
             # object assignment as a change, Panel re-renders it, and its

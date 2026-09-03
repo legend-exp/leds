@@ -72,8 +72,9 @@ with sync_playwright() as p:
   shadow-root child). Enumerate `page.locator("input[type=checkbox]")` and pick
   by index (sidebar order first, then tab controls), then `.click(force=True)`
   and assert `.is_checked()` flipped.
-- Tabs are `dynamic=True`: content builds on first activation — wait after
-  clicking a tab or changing a control, then screenshot.
+- Tab content builds on first activation (the updaters gate on the active tab;
+  the tabs themselves are static) — wait after clicking a tab or changing a
+  control, then screenshot.
 - Always print the collected `pageerror`s before declaring success.
 - **Look at the screenshot** (Read the PNG); a blank frame means the websocket
   origin is wrong (`--allow-websocket-origin localhost:<port>`).

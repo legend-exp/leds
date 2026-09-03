@@ -132,6 +132,106 @@ def test_inactive_tabs_are_not_refreshed_on_a_new_event(display, counter):
     assert counter.counts["all_wf_build"] == 0
 
 
+# ---------------------------------------------------------------- tab switching
+
+
+@pytest.mark.parametrize(
+    ("tab", "pane"),
+    [
+        (app_mod.TAB_DATASET, "dataset_pane"),
+        (app_mod.TAB_VALIDATION, "validation_pane"),
+    ],
+)
+def test_returning_to_a_tab_does_not_touch_the_pane_object(display, tab, pane):
+    """Re-assigning an already rendered figure trips Panel 1.9 (stylesheets TypeError)."""
+    display.tabs.active = tab
+    assert getattr(display, pane).object is not None, "the tab drew on first visit"
+    events = []
+    getattr(display, pane).param.watch(events.append, "object")
+
+    display.tabs.active = app_mod.TAB_EVENT
+    display.tabs.active = tab
+
+    assert events == []
+
+
+def test_a_failing_updater_does_not_abort_the_others(display, monkeypatch):
+    """One tab's bug must surface as a message, not leave another tab half-switched."""
+    calls = []
+
+    def boom():
+        msg = "synthetic dataset failure"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(display, "_update_dataset", boom)
+    monkeypatch.setattr(
+        display, "_update_validation", lambda: calls.append("validation")
+    )
+
+    display.tabs.active = app_mod.TAB_VALIDATION
+
+    assert calls == ["validation"], "the updater after the failing one still ran"
+    assert display.message.visible
+    assert "RuntimeError" in display.message.object
+    assert "dataset" in display.message.object
+
+
+def test_a_build_finished_after_leaving_the_tab_is_ready_on_return(
+    display, monkeypatch
+):
+    """Under nthreads the user can switch away while a tab still builds.
+
+    Tabs are static (always mounted), so the finished figure goes into the
+    hidden tab and the return costs nothing: no rebuild, no re-assignment.
+    """
+    original = app_mod.dataset_view.dataset_figure
+    built = []
+
+    def build_then_leave(*args, **kwargs):
+        result = original(*args, **kwargs)
+        built.append(1)
+        display.tabs.active = app_mod.TAB_EVENT  # the user has moved on meanwhile
+        return result
+
+    monkeypatch.setattr(app_mod.dataset_view, "dataset_figure", build_then_leave)
+
+    display.tabs.active = app_mod.TAB_DATASET
+
+    assert built == [1]
+    assert display.dataset_pane.object is not None, "shown in the hidden tab"
+    events = []
+    display.dataset_pane.param.watch(events.append, "object")
+
+    display.tabs.active = app_mod.TAB_DATASET
+
+    assert built == [1], "not rebuilt"
+    assert events == [], "not re-assigned"
+
+
+def test_tabs_are_static():
+    """Dynamic tabs re-render on the server per switch; rapid switching blanked them."""
+    if not os.environ.get("LEDS_BASE_PATH"):
+        pytest.skip("set $LEDS_BASE_PATH to a production cycle to run these")
+    disp = app_mod.EventDisplay()
+    assert disp.tabs.dynamic is False
+
+
+def test_slow_tabs_show_loading_while_building(display, monkeypatch):
+    original = app_mod.dataset_view.dataset_figure
+    seen = []
+
+    def observe(*args, **kwargs):
+        seen.append(display.dataset_tab.loading)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app_mod.dataset_view, "dataset_figure", observe)
+
+    display.tabs.active = app_mod.TAB_DATASET
+
+    assert seen == [True], "loading while the figure builds"
+    assert display.dataset_tab.loading is False
+
+
 # ---------------------------------------------------------------- serialisation
 
 #: Entry points that are not param watchers: Panel button/tab callbacks, the
