@@ -37,6 +37,11 @@ from panel.io.state import state
 
 _TIMEOUT = 5  # seconds; _validate blocks the IOLoop, so keep LDAP calls short
 
+#: Shown on the login page in LDAP mode only. Assumes the default
+#: ``(uid={username})`` user filter; reword if a deployment ever matches users
+#: on their mail attribute instead.
+LOGIN_HINT = "Use your LEGEND LDAP credentials (username, not email)."
+
 
 @dataclasses.dataclass(frozen=True)
 class LDAPConfig:
@@ -136,6 +141,29 @@ class LDAPLoginHandler(BasicLoginHandler):
             )
             self._auth_error = self._AUTH_UNAVAILABLE
             return False
+
+    def get(self) -> None:
+        # Copy of BasicLoginHandler.get (Panel 1.9.x) plus ``login_hint``, so
+        # the page can say which credentials to use. The shared-password mode
+        # renders the same template without it and shows no hint.
+        from panel.auth import _validate_next_url  # noqa: PLC0415
+        from panel.io.resources import CDN_DIST  # noqa: PLC0415
+
+        try:
+            errormessage = self.get_argument("error")
+        except Exception:
+            errormessage = ""
+        next_url = _validate_next_url(self.get_argument("next", state.base_url))
+        if next_url:
+            self.set_cookie("next_url", next_url)
+        self.write(
+            self._login_template.render(
+                login_endpoint=self._login_endpoint,
+                errormessage=errormessage,
+                login_hint=LOGIN_HINT,
+                PANEL_CDN=CDN_DIST,
+            )
+        )
 
     def post(self) -> None:
         # Copy of BasicLoginHandler.post (Panel 1.9.x) except the error

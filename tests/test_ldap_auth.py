@@ -7,11 +7,16 @@ import ldap3
 import panel as pn
 import pytest
 from ldap3.core.exceptions import LDAPException
-from panel.auth import LOGOUT_TEMPLATE
+from panel.auth import LOGOUT_TEMPLATE, BasicLoginHandler
 
 from leds.app import user_chip
 from leds.cli import _serve
-from leds.ldap_auth import LDAPAuthProvider, LDAPConfig, LDAPLoginHandler
+from leds.ldap_auth import (
+    LOGIN_HINT,
+    LDAPAuthProvider,
+    LDAPConfig,
+    LDAPLoginHandler,
+)
 
 DIRECT_ENV = {
     "LEDS_LDAP_SERVER": "ldaps://ldap.example:636",
@@ -348,6 +353,34 @@ def test_branded_logout_template_wired(serve_kwargs, monkeypatch):
     html = provider._logout_template.render(PANEL_CDN="", LOGIN_ENDPOINT="/login")
     assert "signed out" in html
     assert 'action="./login"' in html  # the way back in
+
+
+def test_login_hint_shown_only_in_ldap_mode(serve_kwargs, monkeypatch):
+    for key, value in DIRECT_ENV.items():
+        monkeypatch.setenv(key, value)
+    _serve(serve_args())
+    template = serve_kwargs["auth_provider"]._login_template
+
+    # LDAP mode: the handler passes the hint, so the page carries it
+    html = template.render(
+        login_endpoint="/login",
+        errormessage="",
+        login_hint=LOGIN_HINT,
+        PANEL_CDN="",
+    )
+    assert LOGIN_HINT in html
+    assert '<p class="login-hint">' in html
+
+    # shared-password mode renders the same template without the variable
+    # (the .login-hint CSS rule is always present; the element is not)
+    plain = template.render(login_endpoint="/login", errormessage="", PANEL_CDN="")
+    assert '<p class="login-hint">' not in plain
+    assert LOGIN_HINT not in plain
+
+
+def test_ldap_handler_overrides_get():
+    # the hint only reaches the page through our get(); guard the override
+    assert LDAPLoginHandler.get is not BasicLoginHandler.get
 
 
 def test_cli_basic_auth_logout_template(serve_kwargs, monkeypatch):
