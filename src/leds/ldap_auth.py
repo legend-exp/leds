@@ -14,9 +14,14 @@ Optionally ``$LEDS_LDAP_GROUP_DN`` restricts access to members of one group.
 
 Plugs into Panel's basic-auth machinery by subclassing the (semi-internal)
 ``BasicLoginHandler``/``BasicAuthProvider`` pair — the same extension pattern
-Panel itself uses for PAM auth. Known-good on Panel 1.9.x; re-check the two
-overridden surfaces (``_validate``/``post`` and the ``login_handler``
-property) when upgrading Panel.
+Panel itself uses for PAM auth. Known-good on Panel 1.9.x; re-check every
+overridden surface when upgrading Panel:
+
+- ``LDAPLoginHandler._validate`` — the credential check itself;
+- ``LDAPLoginHandler.get`` and ``LDAPLoginHandler.post`` — copies of Panel's,
+  each with one addition (the login hint, and the distinct
+  service-unavailable error);
+- ``LDAPAuthProvider.login_handler`` — the class-attribute wiring.
 """
 
 from __future__ import annotations
@@ -36,6 +41,11 @@ from panel.auth import BasicAuthProvider, BasicLoginHandler
 from panel.io.state import state
 
 _TIMEOUT = 5  # seconds; _validate blocks the IOLoop, so keep LDAP calls short
+
+#: Shown on the login page in LDAP mode only. Assumes the default
+#: ``(uid={username})`` user filter; reword if a deployment ever matches users
+#: on their mail attribute instead.
+LOGIN_HINT = "Use your LEGEND LDAP credentials (username, not email)."
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,6 +146,28 @@ class LDAPLoginHandler(BasicLoginHandler):
             )
             self._auth_error = self._AUTH_UNAVAILABLE
             return False
+
+    def get(self) -> None:
+        # Copy of BasicLoginHandler.get (Panel 1.9.x) plus ``login_hint``, so
+        # the page can say which credentials to use. The shared-password mode
+        # renders the same template without it and shows no hint.
+        from panel.auth import _validate_next_url  # noqa: PLC0415
+        from panel.io.resources import CDN_DIST  # noqa: PLC0415
+
+        # Panel wraps this in try/except; a default is equivalent for the
+        # missing-argument case without swallowing unrelated failures.
+        errormessage = self.get_argument("error", "")
+        next_url = _validate_next_url(self.get_argument("next", state.base_url))
+        if next_url:
+            self.set_cookie("next_url", next_url)
+        self.write(
+            self._login_template.render(
+                login_endpoint=self._login_endpoint,
+                errormessage=errormessage,
+                login_hint=LOGIN_HINT,
+                PANEL_CDN=CDN_DIST,
+            )
+        )
 
     def post(self) -> None:
         # Copy of BasicLoginHandler.post (Panel 1.9.x) except the error
