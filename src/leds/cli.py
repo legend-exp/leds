@@ -36,7 +36,16 @@ def _prewarm(base_path):
     from leds.event_viewer import EventViewer  # noqa: PLC0415
 
     try:
-        for path in discover_cycles(resolve_base_paths(base_path)).values():
+        cycles = discover_cycles(resolve_base_paths(base_path))
+    except Exception as exc:
+        print(  # noqa: T201 (operator-facing CLI warning)
+            f"leds: pre-warm skipped ({type(exc).__name__}: {exc})", file=sys.stderr
+        )
+        return
+    # one at a time, so a broken (e.g. half-written tmp) cycle does not leave
+    # the others cold
+    for label, path in cycles.items():
+        try:
             viewer = EventViewer(path)
             runs = viewer.available_runs()
             # the newest run's channelmap is what a new session renders first
@@ -45,10 +54,11 @@ def _prewarm(base_path):
                     for tstamp in runs[period][run][:1]:
                         viewer._channelmap(tstamp)
                         viewer.statuses(tstamp)
-    except Exception as exc:
-        print(  # noqa: T201 (operator-facing CLI warning)
-            f"leds: pre-warm skipped ({type(exc).__name__}: {exc})", file=sys.stderr
-        )
+        except Exception as exc:
+            print(  # noqa: T201 (operator-facing CLI warning)
+                f"leds: pre-warm of {label} skipped ({type(exc).__name__}: {exc})",
+                file=sys.stderr,
+            )
 
 
 def _free_port():
@@ -169,9 +179,10 @@ def main(argv=None):
             "base_path",
             nargs="*",
             default=None,
-            help="one or more directories to search for production cycles "
-            "(defaults to $LEDS_BASE_PATH, which may list several separated "
-            "by the path separator)",
+            help="one or more directories to search for production cycles, "
+            "e.g. prod-blind/ref prod-blind/tmp prod-blind/auto (defaults to "
+            "$LEDS_BASE_PATH, which may list several separated by the path "
+            "separator)",
         )
 
     serve = sub.add_parser("serve", help="run the hosted multi-user server")

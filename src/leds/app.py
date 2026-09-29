@@ -29,7 +29,7 @@ from leds.all_waveforms_view import (
     y_axis_label,
 )
 from leds.array_view import build_source_data, empty_source, make_event_figure
-from leds.config import discover_cycles, resolve_base_paths
+from leds.config import cycle_groups, discover_cycles, resolve_base_paths
 from leds.event_viewer import EventViewer, parse_timestamp
 from leds.spectrum import (
     BINARY_CUTS,
@@ -1379,9 +1379,7 @@ class EventDisplay(param.Parameterized):
             lambda d: f"**Selected detector:** {d or '—'}", self.param.selected_detector
         )
         return pn.Column(
-            pn.widgets.Select.from_param(
-                self.param.production_cycle, name="Production cycle"
-            ),
+            self._cycle_select(),
             pn.layout.Divider(),
             pn.widgets.Select.from_param(self.param.period, name="Period"),
             pn.widgets.Select.from_param(self.param.run, name="Run"),
@@ -1413,6 +1411,22 @@ class EventDisplay(param.Parameterized):
             pn.pane.Markdown(selected),
             self.message,
         )
+
+    def _cycle_select(self):
+        """The production-cycle dropdown, in ref / tmp / auto sections."""
+        groups = cycle_groups(self._cycle_paths)
+        if groups is None:
+            return pn.widgets.Select.from_param(
+                self.param.production_cycle, name="Production cycle"
+            )
+        select = pn.widgets.Select(
+            name="Production cycle", groups=groups, value=self.production_cycle
+        )
+        # from_param would pass the param's objects as ``options``, which Panel
+        # rejects alongside ``groups``, so link the value both ways by hand
+        select.param.watch(lambda e: setattr(self, "production_cycle", e.new), "value")
+        self.param.watch(lambda e: setattr(select, "value", e.new), "production_cycle")
+        return select
 
     def panel(self):
         return self.tabs

@@ -28,6 +28,14 @@ The production-cycle path (a directory containing `dataflow-config.yaml`, or a
 directory of such cycles) can also come from `$LEDS_BASE_PATH`; several paths
 may be listed separated by `:`.
 
+Cycles inside directories named `ref`, `tmp` or `auto` are listed in that order
+as sections of the production-cycle dropdown, newest first, with the newest ref
+cycle selected at start:
+
+```bash
+export LEDS_BASE_PATH=$PRODENV/prod-blind/ref:$PRODENV/prod-blind/tmp:$PRODENV/prod-blind/auto
+```
+
 ## Deployment (NERSC Spin)
 
 The `Dockerfile` builds a slim two-stage image by cloning this repository:
