@@ -378,7 +378,6 @@ class EventDisplay(param.Parameterized):
         )
 
         self.dataset_pane = pn.pane.Bokeh(sizing_mode="stretch_width")
-        self._dataset_figs: dict = {}  # (datatype, plot) -> figure, per cycle
         self.dataset_datatype_select = pn.widgets.Select.from_param(
             self.param.dataset_datatype, name="Datatype", width=90
         )
@@ -403,7 +402,6 @@ class EventDisplay(param.Parameterized):
         self.validation_area = pn.Column(
             self.validation_pane, sizing_mode="stretch_width"
         )
-        self._validation_figs: dict = {}  # per-period/plot figures, per cycle
         self._cal_cache: dict = {}  # (cycle, period, run) -> calibration residuals
         self.validation_bin_select = pn.widgets.Select.from_param(
             self.param.validation_bin_width, name="Bin width", width=90
@@ -670,8 +668,6 @@ class EventDisplay(param.Parameterized):
         self.run_spectrum = RunSpectrum(self.viewer)
         self.processor = WaveformProcessor(self.viewer)
         self.validation_data = validation.ValidationData(self.viewer)
-        self._dataset_figs.clear()
-        self._validation_figs.clear()
         self._cal_cache.clear()
         self._tab_state.clear()
         self._all_wf_figure = AllWaveformsFigure()
@@ -1038,7 +1034,8 @@ class EventDisplay(param.Parameterized):
         self._tab_drawn(TAB_WAVEFORMS, key)
 
     def _update_dataset(self):
-        # metadata matrices are static per cycle, so build lazily and cache
+        # built lazily, from shared-cached statuses/runinfo; see _update_validation
+        # for why the figure itself is never kept and re-shown
         if self.tabs.active != TAB_DATASET or self.viewer is None:
             return
         # the "data" view shows all datatypes at once; the toggle is moot there
@@ -1047,30 +1044,25 @@ class EventDisplay(param.Parameterized):
         key = ("all" if all_datatypes else self.dataset_datatype, self.dataset_plot)
         if self._tab_is_current(TAB_DATASET, (self.production_cycle, key)):
             return  # already on screen; re-assigning re-serialises the figure
-        fig = self._dataset_figs.get(key)
-        if fig is None:
-            self.dataset_tab.loading = True
-            try:
-                fig, source = dataset_view.dataset_figure(
-                    self.viewer, plot=self.dataset_plot, datatype=self.dataset_datatype
-                )
-            except (KeyError, FileNotFoundError, OSError) as exc:
-                self.message.object = f"**dataset view:** {type(exc).__name__}: {exc}"
-                self.message.visible = True
-                return
-            finally:
-                self.dataset_tab.loading = False
-            # tap a cell/bar -> jump the event display to that run (handler
-            # attached once per built figure; the cache prevents duplicates)
-            source.selected.on_change(
-                "indices", lambda _a, _o, new, s=source: self._on_dataset_tap(s, new)
+        self.dataset_tab.loading = True
+        try:
+            fig, source = dataset_view.dataset_figure(
+                self.viewer, plot=self.dataset_plot, datatype=self.dataset_datatype
             )
-            self._dataset_figs[key] = fig
+        except (KeyError, FileNotFoundError, OSError) as exc:
+            self.message.object = f"**dataset view:** {type(exc).__name__}: {exc}"
+            self.message.visible = True
+            return
+        finally:
+            self.dataset_tab.loading = False
+        # tap a cell/bar -> jump the event display to that run
+        source.selected.on_change(
+            "indices", lambda _a, _o, new, s=source: self._on_dataset_tap(s, new)
+        )
         # the user may have moved on while this built (under nthreads the tab
         # switch runs on another thread); the tab stays mounted, so the figure
         # is shown there and is ready when they return
-        if fig is not self.dataset_pane.object:  # see _update_validation
-            self.dataset_pane.object = fig
+        self.dataset_pane.object = fig
         self._tab_drawn(TAB_DATASET, (self.production_cycle, key))
 
     def _on_dataset_tap(self, source, new):
@@ -1098,8 +1090,12 @@ class EventDisplay(param.Parameterized):
 
     def _update_validation(self):
         # everything is served from the binned per-run cache / parsed par
-        # files, so rebuilding on control changes is cheap; figures are still
-        # cached so revisiting a plot is instant
+        # files, so a figure is rebuilt (~10-30 ms) whenever what it draws
+        # changes. Figures are deliberately NOT cached: re-showing one Panel
+        # has already rendered makes the pane's ``_sync_properties`` copy the
+        # figure's themed ``stylesheets`` (ImportedStyleSheet models) into its
+        # str-only param and raise (Panel 1.9), which left the previous plot
+        # on screen. Returning to the tab is still free (_tab_is_current).
         if self.tabs.active != TAB_VALIDATION or self.viewer is None:
             return
         plot = self.validation_plot
@@ -1131,13 +1127,7 @@ class EventDisplay(param.Parameterized):
             raise
         finally:
             self.validation_tab.loading = False
-        # never re-assign the figure already on screen: param treats any
-        # object assignment as a change, Panel re-renders it, and its
-        # ``_sync_properties`` then copies the rendered figure's themed
-        # ``stylesheets`` (ImportedStyleSheet models) into the pane's
-        # str-only param and raises (Panel 1.9)
-        if fig is not self.validation_pane.object:
-            self.validation_pane.object = fig
+        self.validation_pane.object = fig
         if self.validation_area.objects != [self.validation_pane]:
             self.validation_area[:] = [self.validation_pane]
         # re-read the state: building a calibration plot can re-point
@@ -1168,56 +1158,38 @@ class EventDisplay(param.Parameterized):
         )
 
     def _validation_figure(self, plot):
-        """Build (or fetch from cache) the requested validation figure."""
+        """Build the requested validation figure (from cached data)."""
         if plot in validation_view.RATE_BUILDERS:
             scope = self.validation_string
-            key = (
+            times, rates = self.validation_data.period_series(
                 self.period,
-                plot,
-                self.validation_bin_width,
-                self.validation_log_y,
-                scope,
+                validation.BIN_WIDTHS[self.validation_bin_width],
+                string=None if scope == "all strings" else int(scope),
             )
-            fig = self._validation_figs.get(key)
-            if fig is None:
-                times, rates = self.validation_data.period_series(
-                    self.period,
-                    validation.BIN_WIDTHS[self.validation_bin_width],
-                    string=None if scope == "all strings" else int(scope),
-                )
-                if times.size == 0:
-                    msg = f"no event data in period {self.period}"
-                    raise _Unavailable(msg)
-                fig = validation_view.RATE_BUILDERS[plot](
-                    times,
-                    rates,
-                    self.validation_bin_width,
-                    log_y=self.validation_log_y,
-                    scope=scope if scope == "all strings" else f"string {scope}",
-                )
-            return self._cache_validation_fig(key, fig)
+            if times.size == 0:
+                msg = f"no event data in period {self.period}"
+                raise _Unavailable(msg)
+            return validation_view.RATE_BUILDERS[plot](
+                times,
+                rates,
+                self.validation_bin_width,
+                log_y=self.validation_log_y,
+                scope=scope if scope == "all strings" else f"string {scope}",
+            )
 
         # calibration plots: the run's residuals are ~100 numexpr evaluations
         # and are needed to populate the detector selector, so they are cached
         # per run -- otherwise merely picking a different detector recomputes
-        # them all, even when the figure itself is already cached
+        # them all
         names, residuals, strings, label, pars = self._cal_data()
         self.param.validation_detector.objects = names
         if self.validation_detector not in names:
             self._set_quietly(validation_detector=names[0])
 
         if plot == "calibration summary":
-            key = (self.period, self.run, plot)
-            fig = self._validation_figs.get(key)
-            if fig is None:
-                fig = validation_view.cal_summary(names, residuals, strings, label)
-        else:  # calibration detail
-            key = (self.period, self.run, plot, self.validation_detector)
-            fig = self._validation_figs.get(key)
-            if fig is None:
-                curve = validation.cal_curve(pars, self.validation_detector)
-                fig = validation_view.cal_detail(curve, self.validation_detector, label)
-        return self._cache_validation_fig(key, fig)
+            return validation_view.cal_summary(names, residuals, strings, label)
+        curve = validation.cal_curve(pars, self.validation_detector)
+        return validation_view.cal_detail(curve, self.validation_detector, label)
 
     def _cal_data(self):
         """``(names, residuals, strings, label, pars)`` for the run, cached.
@@ -1262,12 +1234,6 @@ class EventDisplay(param.Parameterized):
             self.param.validation_string.objects = opts
             if self.validation_string not in opts:
                 self._set_quietly(validation_string="all strings")
-
-    def _cache_validation_fig(self, key, fig):
-        self._validation_figs[key] = fig
-        while len(self._validation_figs) > 16:
-            self._validation_figs.pop(next(iter(self._validation_figs)))
-        return fig
 
     def _cal_residuals(self, pars):
         """String-ordered residuals for the calibration summary plot."""
