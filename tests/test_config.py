@@ -35,13 +35,9 @@ def test_cycles_ordered_ref_tmp_auto_newest_first(tmp_path):
     ]
     assert cycles["tmp/v2.1.0"] == prod / "tmp" / "v2.1.0"
     assert cycle_groups(cycles) == {
-        "ref": {
-            "v2.10.0": "ref/v2.10.0",
-            "v2.9.1": "ref/v2.9.1",
-            "v2.0.0": "ref/v2.0.0",
-        },
-        "tmp": {"v2.1.0dev1": "tmp/v2.1.0dev1", "v2.1.0": "tmp/v2.1.0"},
-        "auto": {"latest": "auto/latest"},
+        "ref": ["ref/v2.10.0", "ref/v2.9.1", "ref/v2.0.0"],
+        "tmp": ["tmp/v2.1.0dev1", "tmp/v2.1.0"],
+        "auto": ["auto/latest"],
     }
 
 
@@ -61,10 +57,7 @@ def test_unclassified_cycles_follow_the_kinds_under_other(tmp_path):
     cycles = discover_cycles([tmp_path / "prod" / "ref", bare])
 
     assert list(cycles) == ["ref/v1", "mock_prod"]
-    assert cycle_groups(cycles) == {
-        "ref": {"v1": "ref/v1"},
-        "other": {"mock_prod": "mock_prod"},
-    }
+    assert cycle_groups(cycles) == {"ref": ["ref/v1"], "other": ["mock_prod"]}
 
 
 def test_plain_cycles_keep_a_plain_dropdown(tmp_path):

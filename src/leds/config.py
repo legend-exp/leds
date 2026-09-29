@@ -143,20 +143,17 @@ def discover_cycles(
     return dict(items)
 
 
-def cycle_groups(cycles: dict[str, Path]) -> dict[str, dict[str, str]] | None:
-    """Dropdown sections ``{kind: {shown name: label}}`` for ``cycles``.
+def cycle_groups(cycles: dict[str, Path]) -> dict[str, list[str]] | None:
+    """Dropdown sections ``{kind: [label, ...]}`` for ``cycles``.
 
     In the order of ``cycles`` (see :func:`discover_cycles`), with the
-    unclassified ones under "other". ``None`` when no cycle has a kind, so a
-    plain local cycle keeps a plain dropdown.
+    unclassified ones under "other". Options keep their full ``ref/v2.1.0``
+    label so the closed dropdown still says which kind is selected. ``None``
+    when no cycle has a kind, so a plain local cycle keeps a plain dropdown.
     """
-    groups: dict[str, dict[str, str]] = {}
+    groups: dict[str, list[str]] = {}
     for label, path in cycles.items():
-        kind = cycle_kind(path)
-        shown = (
-            label.split("/", 1)[1] if kind and label.startswith(f"{kind}/") else label
-        )
-        groups.setdefault(kind or "other", {})[shown] = label
+        groups.setdefault(cycle_kind(path) or "other", []).append(label)
     return None if set(groups) <= {"other"} else groups
 
 
