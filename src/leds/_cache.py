@@ -135,7 +135,8 @@ METADATA = SharedLRU(8, ttl=METADATA_TTL, name="metadata")
 #: per run of the cycle.
 STATUSES = SharedLRU(256, ttl=METADATA_TTL, name="statuses")
 
-#: ``(par_file,)`` -> parsed ``par_hit`` dict. MB-scale each, and ~0.7 s to
+#: ``(par_root, files)`` -> parsed ``par_hit``/``par_pht`` dict (the files
+#: ``validity.yaml`` lists for a start key, merged by ``TextDB``). MB-scale each, and ~0.7 s to
 #: parse, so a small cache with a big payoff. A reprocessing rewrites these
 #: files in place under the same name, hence the TTL.
 CAL_PARS = SharedLRU(

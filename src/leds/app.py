@@ -144,6 +144,13 @@ def _serialized(method):
     return wrapper
 
 
+class _Unavailable(Exception):
+    """A validation plot that cannot be drawn for the current state.
+
+    Carries the reason, which is shown in the tab in place of the plot.
+    """
+
+
 def build_header_links():
     """Row of LEGEND resource icon-links, as in the monitoring dashboard header."""
     return pn.Row(
@@ -389,6 +396,13 @@ class EventDisplay(param.Parameterized):
         )
 
         self.validation_pane = pn.pane.Bokeh(sizing_mode="stretch_width")
+        # why the selected plot cannot be drawn, shown in place of the pane
+        self.validation_note = pn.pane.Alert("", alert_type="warning")
+        # holds either [pane] or [note], so a plot that cannot be drawn never
+        # leaves the previous one on screen
+        self.validation_area = pn.Column(
+            self.validation_pane, sizing_mode="stretch_width"
+        )
         self._validation_figs: dict = {}  # per-period/plot figures, per cycle
         self._cal_cache: dict = {}  # (cycle, period, run) -> calibration residuals
         self.validation_bin_select = pn.widgets.Select.from_param(
@@ -413,7 +427,7 @@ class EventDisplay(param.Parameterized):
                 self.validation_log_toggle,
                 self.validation_detector_select,
             ),
-            self.validation_pane,
+            self.validation_area,
             sizing_mode="stretch_width",
             min_height=600,
             scroll=True,
@@ -1101,23 +1115,44 @@ class EventDisplay(param.Parameterized):
         self.validation_tab.loading = True
         try:
             fig = self._validation_figure(plot)
-        except (KeyError, ValueError, FileNotFoundError, OSError) as exc:
-            self.message.object = f"**validation:** {type(exc).__name__}: {exc}"
-            self.message.visible = True
+        except _Unavailable as exc:
+            self._show_validation_note(str(exc))
+            # nothing to draw is an answer for this state; don't redo the
+            # lookup until something it depends on changes
+            self._tab_drawn(TAB_VALIDATION, self._validation_state())
             return
+        except (KeyError, ValueError, FileNotFoundError, OSError) as exc:
+            self._show_validation_note(f"{type(exc).__name__}: {exc}")
+            return
+        except Exception as exc:
+            # unexpected: still replace the stale plot, then let _guarded
+            # log the traceback
+            self._show_validation_note(f"{type(exc).__name__}: {exc}")
+            raise
         finally:
             self.validation_tab.loading = False
-        if fig is not None:
-            # never re-assign the figure already on screen: param treats any
-            # object assignment as a change, Panel re-renders it, and its
-            # ``_sync_properties`` then copies the rendered figure's themed
-            # ``stylesheets`` (ImportedStyleSheet models) into the pane's
-            # str-only param and raises (Panel 1.9)
-            if fig is not self.validation_pane.object:
-                self.validation_pane.object = fig
-            # re-read the state: building a calibration plot can re-point
-            # validation_detector at the run's first detector
-            self._tab_drawn(TAB_VALIDATION, self._validation_state())
+        # never re-assign the figure already on screen: param treats any
+        # object assignment as a change, Panel re-renders it, and its
+        # ``_sync_properties`` then copies the rendered figure's themed
+        # ``stylesheets`` (ImportedStyleSheet models) into the pane's
+        # str-only param and raises (Panel 1.9)
+        if fig is not self.validation_pane.object:
+            self.validation_pane.object = fig
+        if self.validation_area.objects != [self.validation_pane]:
+            self.validation_area[:] = [self.validation_pane]
+        # re-read the state: building a calibration plot can re-point
+        # validation_detector at the run's first detector
+        self._tab_drawn(TAB_VALIDATION, self._validation_state())
+
+    def _show_validation_note(self, text):
+        """Show why the selected validation plot cannot be drawn, in the tab."""
+        # the reasons carry paths and par_<tier> names: keep markdown from
+        # reading their underscores as emphasis
+        text = text.replace("_", r"\_").replace("*", r"\*")
+        self.validation_note.object = f"**validation:** {text}"
+        self.validation_area[:] = [self.validation_note]
+        self.message.object = self.validation_note.object
+        self.message.visible = True
 
     def _validation_state(self):
         """Everything the validation pane is drawn from."""
@@ -1151,11 +1186,8 @@ class EventDisplay(param.Parameterized):
                     string=None if scope == "all strings" else int(scope),
                 )
                 if times.size == 0:
-                    self.message.object = (
-                        f"**validation:** no event data in period {self.period}"
-                    )
-                    self.message.visible = True
-                    return None
+                    msg = f"no event data in period {self.period}"
+                    raise _Unavailable(msg)
                 fig = validation_view.RATE_BUILDERS[plot](
                     times,
                     rates,
@@ -1169,10 +1201,7 @@ class EventDisplay(param.Parameterized):
         # and are needed to populate the detector selector, so they are cached
         # per run -- otherwise merely picking a different detector recomputes
         # them all, even when the figure itself is already cached
-        cal = self._cal_data()
-        if cal is None:
-            return None
-        names, residuals, strings, label = cal
+        names, residuals, strings, label, pars = self._cal_data()
         self.param.validation_detector.objects = names
         if self.validation_detector not in names:
             self._set_quietly(validation_detector=names[0])
@@ -1186,33 +1215,39 @@ class EventDisplay(param.Parameterized):
             key = (self.period, self.run, plot, self.validation_detector)
             fig = self._validation_figs.get(key)
             if fig is None:
-                pars, _label = self.validation_data.load_cal_pars(self.period, self.run)
                 curve = validation.cal_curve(pars, self.validation_detector)
                 fig = validation_view.cal_detail(curve, self.validation_detector, label)
         return self._cache_validation_fig(key, fig)
 
     def _cal_data(self):
-        """``(names, residuals, strings, label)`` for the run, cached.
+        """``(names, residuals, strings, label, pars)`` for the run, cached.
 
-        ``None`` (with the reason shown) when the run has no usable
-        energy-calibration results.
+        Tries each par tier with pars for the run (preferred first) and uses
+        the first with usable energy-calibration results. Raises
+        :class:`_Unavailable` with the reason when there is none.
         """
         key = (self.production_cycle, self.period, self.run)
         cached = self._cal_cache.pop(key, None)  # re-inserted below (LRU order)
         if cached is None:
-            pars, label = self.validation_data.load_cal_pars(self.period, self.run)
-            if pars is None:
-                self.message.object = f"**validation:** {label}"
-                self.message.visible = True
-                return None
-            names, residuals, strings = self._cal_residuals(pars)
-            if not names:
-                self.message.object = (
-                    f"**validation:** no usable energy-calibration results in {label}"
+            sources, reason = self.validation_data.cal_par_sources(
+                self.period, self.run
+            )
+            if not sources:
+                raise _Unavailable(reason)
+            unusable = []
+            for source in sources:
+                pars, label = self.validation_data.load_cal_source(source)
+                names, residuals, strings = self._cal_residuals(pars)
+                if names:
+                    cached = (names, residuals, strings, label, pars)
+                    break
+                unusable.append(label)
+            else:
+                msg = (
+                    "no usable energy-calibration results in "
+                    f"{', '.join(unusable)} for {self.period} {self.run}"
                 )
-                self.message.visible = True
-                return None
-            cached = (names, residuals, strings, label)
+                raise _Unavailable(msg)
         self._cal_cache[key] = cached
         while len(self._cal_cache) > 4:
             self._cal_cache.pop(next(iter(self._cal_cache)))
@@ -1258,7 +1293,7 @@ class EventDisplay(param.Parameterized):
     def _on_validation_controls(self):
         if self._internal_change:
             return
-        self._update_validation()
+        self._guarded("validation", self._update_validation)
 
     @param.depends("all_wf_grouping", watch=True)
     @_serialized

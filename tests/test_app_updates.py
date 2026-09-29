@@ -176,6 +176,25 @@ def test_a_failing_updater_does_not_abort_the_others(display, monkeypatch):
     assert "dataset" in display.message.object
 
 
+def test_an_undrawable_validation_plot_replaces_the_previous_one(display, monkeypatch):
+    """No calibration pars must say why in the tab, not leave the last plot up."""
+    display.tabs.active = app_mod.TAB_VALIDATION
+    assert display.validation_area.objects == [display.validation_pane]
+    monkeypatch.setattr(
+        display.validation_data,
+        "cal_par_sources",
+        lambda _p, _r: ([], "no calibration pars valid (searched par_hit=/x)"),
+    )
+
+    display.validation_plot = "calibration summary"
+
+    assert display.validation_area.objects == [display.validation_note]
+    assert r"searched par\_hit=/x" in display.validation_note.object
+
+    display.validation_plot = next(iter(app_mod.validation_view.RATE_BUILDERS))
+    assert display.validation_area.objects == [display.validation_pane]
+
+
 def test_a_build_finished_after_leaving_the_tab_is_ready_on_return(
     display, monkeypatch
 ):
