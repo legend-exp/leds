@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import os
-import re
+import struct
 from pathlib import Path
 
 from dbetto import AttrsDict, Props
@@ -18,6 +20,28 @@ ENV_BASE_PATH = "LEDS_BASE_PATH"
 #: holds them: ``prod-blind/ref/v2.1.0``, ``prod-blind/tmp/v2.1.0dev1``,
 #: ``prod-blind/auto/latest``.
 CYCLE_KINDS = ("ref", "tmp", "auto")
+
+#: Event tiers the viewer can open (see ``EventViewer``); a cycle with neither
+#: is not listed.
+EVENT_TIERS = ("pet", "evt")
+
+# glibc statx(), for birth times: Python has no st_birthtime on Linux
+_AT_FDCWD = -100
+_AT_SYMLINK_NOFOLLOW = 0x100
+_STATX_BTIME = 0x800
+_STATX_BTIME_OFFSET = 80  # of stx_btime in struct statx
+try:
+    _statx = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True).statx
+    _statx.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+    ]
+    _statx.restype = ctypes.c_int
+except (OSError, AttributeError, TypeError):  # not glibc (e.g. macOS)
+    _statx = None
 
 
 def resolve_base_path(base_path: str | os.PathLike | None = None) -> Path:
@@ -95,10 +119,48 @@ def cycle_kind(path: str | os.PathLike) -> str | None:
     return kind if kind in CYCLE_KINDS else None
 
 
-def _natural_key(name: str) -> list:
-    # "v2.10.0" after "v2.9.0": digit runs compare as numbers (re.split with a
-    # group alternates str/int from a str, so positions always compare alike)
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+def _statx_birthtime(path: Path) -> float | None:
+    """``path``'s own birth time from ``statx``, ``None`` if not reported."""
+    if _statx is None:
+        return None
+    buf = ctypes.create_string_buffer(256)
+    flags = _AT_SYMLINK_NOFOLLOW
+    if _statx(_AT_FDCWD, os.fsencode(path), flags, _STATX_BTIME, buf) != 0:
+        return None
+    (mask,) = struct.unpack_from("I", buf, 0)
+    if not mask & _STATX_BTIME:
+        return None
+    sec, nsec = struct.unpack_from("qI", buf, _STATX_BTIME_OFFSET)
+    return sec + nsec / 1e9
+
+
+def _created(path: str | os.PathLike) -> float:
+    """When ``path`` itself was created (for a symlink: the link, not its target).
+
+    The birth time where the filesystem reports it. Otherwise a symlink's own
+    mtime (links are never modified), or the cycle config's mtime (a cycle
+    directory's own mtime changes with its contents).
+    """
+    path = Path(path)
+    st = os.lstat(path)
+    born = getattr(st, "st_birthtime", None) or _statx_birthtime(path)
+    if born:
+        return born
+    if path.is_symlink():
+        return st.st_mtime
+    return (path / CONFIG_FILENAME).stat().st_mtime
+
+
+def has_event_tier(cycle_dir: str | os.PathLike, datatype: str = "phy") -> bool:
+    """Whether the cycle has an event tier (``EVENT_TIERS``) the viewer can open."""
+    try:
+        paths = load_paths(cycle_dir)
+        return any(
+            f"tier_{t}" in paths and (Path(paths[f"tier_{t}"]) / datatype).is_dir()
+            for t in EVENT_TIERS
+        )
+    except Exception:  # unreadable or half-written config
+        return False
 
 
 def discover_cycles(
@@ -113,8 +175,12 @@ def discover_cycles(
     A cycle inside a ``ref``/``tmp``/``auto`` directory is labelled
     ``<kind>/<name>`` (the same version can exist as both ref and tmp); any
     other by its directory name, qualified with the parent's name only when
-    two would collide. Ordered by kind (``CYCLE_KINDS``, then unclassified),
-    newest first within each, so the first is the newest ref cycle.
+    two would collide. Cycles without an event tier (see :func:`has_event_tier`)
+    are left out.
+
+    Ordered by kind (``CYCLE_KINDS``, then unclassified); within a kind,
+    symlinks (``auto/latest``, ``tmp/p19+``) come first, then the cycles
+    themselves, each newest first by creation time (:func:`_created`).
     """
     cycles: dict[str, Path] = {}
     for root in resolve_base_paths(base_path):
@@ -123,7 +189,7 @@ def discover_cycles(
         )
         if not found and (root / CONFIG_FILENAME).is_file():
             found = [root]  # the base path is itself a single cycle
-        for cdir in found:
+        for cdir in filter(has_event_tier, found):
             kind = cycle_kind(cdir)
             label = f"{kind}/{cdir.name}" if kind else cdir.name
             if label in cycles and cycles[label] != cdir:
@@ -132,15 +198,17 @@ def discover_cycles(
                     label = f"{cdir.parent.parent.name}/{label}"
             cycles[label] = cdir
 
-    def kind_rank(item):
-        kind = cycle_kind(item[1])
-        return CYCLE_KINDS.index(kind) if kind else len(CYCLE_KINDS)
+    def order(item):
+        label, path = item
+        kind = cycle_kind(path)
+        try:
+            created = _created(path)
+        except OSError:  # vanished while scanning
+            created = 0.0
+        rank = CYCLE_KINDS.index(kind) if kind else len(CYCLE_KINDS)
+        return rank, not path.is_symlink(), -created, label
 
-    items = sorted(
-        cycles.items(), key=lambda kv: _natural_key(kv[1].name), reverse=True
-    )
-    items.sort(key=kind_rank)  # stable: stays newest first within a kind
-    return dict(items)
+    return dict(sorted(cycles.items(), key=order))
 
 
 def cycle_groups(cycles: dict[str, Path]) -> dict[str, list[str]] | None:
