@@ -29,12 +29,16 @@ directory of such cycles) can also come from `$LEDS_BASE_PATH`; several paths
 may be listed separated by `:`.
 
 Cycles inside directories named `ref`, `tmp` or `auto` are listed in that order
-as sections of the production-cycle dropdown, newest first, with the newest ref
-cycle selected at start:
+as sections of the production-cycle dropdown:
 
 ```bash
 export LEDS_BASE_PATH=$PRODENV/prod-blind/ref:$PRODENV/prod-blind/tmp:$PRODENV/prod-blind/auto
 ```
+
+Within a section, symlinks (`auto/latest`, `tmp/p19+`) come first, then the
+cycles themselves, each newest first by creation time. The first entry is
+selected at start. Cycles without a `pet` or `evt` tier (e.g. raw-only ones) are
+not listed, since there are no events to show.
 
 ## Deployment (NERSC Spin)
 
@@ -49,6 +53,16 @@ docker push registry.nersc.gov/<project>/leds:latest
 
 (Point `LEDS_REPO` at a fork while changes are not upstream yet.) The container
 listens on port 5006 and runs under an arbitrary non-root UID, as Spin requires.
+
+Mount the whole `prod-blind` directory as **one** read-only volume, e.g. at
+`/prod-blind`, and set
+`LEDS_BASE_PATH=/prod-blind/ref:/prod-blind/tmp:/prod-blind/auto`. Two reasons:
+
+- A cycle's section comes from the name of its parent directory **inside the
+  container**, so the mount points must end in `ref`, `tmp` and `auto`.
+- tmp and auto cycles read their raw tier through relative paths into ref
+  (`$_/../../ref/v3.0.0/generated/tier/raw`), so separate volumes break their
+  waveforms.
 
 ### Service environment
 
