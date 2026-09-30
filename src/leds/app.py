@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.resources
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial, wraps
 
@@ -50,6 +51,11 @@ LEGEND_LOGO = "https://legend-exp.org/typo3conf/ext/sitepackage/Resources/Public
 LEGEND_FAVICON = "https://legend-exp.org/typo3conf/ext/sitepackage/Resources/Public/Favicons/android-chrome-96x96.png"
 HEADER_BACKGROUND = "#f8f8fa"
 HEADER_COLOR = "#1A2A5B"
+
+#: Warms the Validation tab's shared caches while the user is elsewhere (see
+#: EventDisplay._prefetch_validation). One thread per worker, so background
+#: reads never take more than one thread from foreground ones.
+_PREFETCH = ThreadPoolExecutor(max_workers=1, thread_name_prefix="leds-prefetch")
 
 # tab order (used for both layout and the lazy per-tab update gating)
 TAB_EVENT, TAB_DETAILS, TAB_WAVEFORMS, TAB_SPECTRUM, TAB_DATASET, TAB_VALIDATION = (
@@ -403,6 +409,7 @@ class EventDisplay(param.Parameterized):
             self.validation_pane, sizing_mode="stretch_width"
         )
         self._cal_cache: dict = {}  # (cycle, period, run) -> calibration residuals
+        self._prefetch = pn.state.curdoc is not None  # server sessions only
         self.validation_bin_select = pn.widgets.Select.from_param(
             self.param.validation_bin_width, name="Bin width", width=90
         )
@@ -654,12 +661,38 @@ class EventDisplay(param.Parameterized):
         self._render()
         self._update_run_spectrum()
         self._update_validation()
+        self._prefetch_validation()
         if self.playing:  # keep the playback end-stop in sync
             self._run_length = (
                 self.viewer.run_length(self.period, self.run)
                 if self.viewer is not None and self.period and self.run
                 else None
             )
+
+    def _prefetch_validation(self):
+        """Start the Validation tab's reads for this period and run in the background.
+
+        A period's first rate plot reads every file of every run (tens of
+        seconds cold). Starting it on the period change means the tab is
+        ready, or part-built, when opened: the shared caches let the tab's
+        own request wait on this build instead of repeating it.
+        """
+        if not self._prefetch or self.viewer is None or not self.period:
+            return
+        data, period, run = self.validation_data, self.period, self.run
+        bin_seconds = validation.BIN_WIDTHS[self.validation_bin_width]
+
+        def job():
+            if (self.validation_data, self.period, self.run) != (data, period, run):
+                return  # the user moved on before this started
+            try:
+                data.period_series(period, bin_seconds)
+                if run:
+                    data.load_cal_pars(period, run)
+            except Exception:
+                pass  # the tab reports it when opened
+
+        _PREFETCH.submit(job)
 
     @param.depends("production_cycle", watch=True)
     @_serialized

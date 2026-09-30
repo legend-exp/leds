@@ -135,12 +135,12 @@ METADATA = SharedLRU(8, ttl=METADATA_TTL, name="metadata")
 #: per run of the cycle.
 STATUSES = SharedLRU(256, ttl=METADATA_TTL, name="statuses")
 
-#: ``(par_root, files)`` -> parsed ``par_hit``/``par_pht`` dict (the files
-#: ``validity.yaml`` lists for a start key, merged by ``TextDB``). MB-scale each, and ~0.7 s to
-#: parse, so a small cache with a big payoff. A reprocessing rewrites these
-#: files in place under the same name, hence the TTL.
+#: ``(par_root, files)`` -> the calibration part of the ``par_hit``/``par_pht``
+#: files ``validity.yaml`` lists for a start key, merged. ~5 MB and ~0.5 s to
+#: parse each (the whole file would be ~40 MB and ~10 s). A reprocessing
+#: rewrites these files in place under the same name, hence the TTL.
 CAL_PARS = SharedLRU(
-    _env_int("LEDS_MAX_CACHED_CAL_PARS", 4), ttl=METADATA_TTL, name="cal_pars"
+    _env_int("LEDS_MAX_CACHED_CAL_PARS", 32), ttl=METADATA_TTL, name="cal_pars"
 )
 
 #: Directory scans: ``(tier_root,)`` -> run tree, ``(tier_root, period, run)``
@@ -157,11 +157,15 @@ N_EVENTS = SharedLRU(4096, name="n_events")
 #: the file list, so a run that gains a file is a new entry, not a stale one.
 RUN_SPECTRA = SharedLRU(_env_int("LEDS_MAX_CACHED_RUN_SPECTRA", 4), name="run_spectra")
 
-#: ``(tier_root, period, run, files, string)`` -> binned validation summary.
-#: Reduced to ~150 kB per entry, so this can be generous. The per-string
-#: entries select hits by a rawid -> string map read from the channelmap, so
-#: they are metadata-derived and expire with it.
-VALIDATION_SUMMARIES = SharedLRU(256, ttl=METADATA_TTL, name="validation_summaries")
+#: ``(tier_root, period, run, files)`` -> binned validation summary of a run,
+#: all strings included: ~1.3 MB each. The per-string counts select hits by a
+#: rawid -> string map read from the channelmap, so they are metadata-derived
+#: and expire with it.
+VALIDATION_SUMMARIES = SharedLRU(
+    _env_int("LEDS_MAX_CACHED_VALIDATION_RUNS", 64),
+    ttl=METADATA_TTL,
+    name="validation_summaries",
+)
 
 #: Every cache above, for the warm-up path and for tests.
 ALL = (

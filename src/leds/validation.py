@@ -5,11 +5,12 @@ reduced to time-binned counts (boost-histogram, 15-min base bins on a
 day-aligned absolute axis) and dropped — only the tiny binned summaries are
 cached (~150 kB per run), so a whole period never holds per-hit arrays.
 Rebinning to the user-selected width is pure array arithmetic on the cache.
+Every string's counts come from the same read, so scoping costs no re-read.
 
-Calibration curves come from the ``par_hit`` / ``par_pht`` YAMLs, loaded
-through dbetto's ``TextDB`` at the viewed run's start key (so ``validity.yaml``
-decides which cal run applies), not from lh5 data: the fitted peak centroids
-(ADC) and the calibration expression are all that is needed.
+Calibration curves come from the ``par_hit`` / ``par_pht`` YAMLs valid at the
+viewed run's start key (so ``validity.yaml`` decides which cal run applies),
+not from lh5 data: the fitted peak centroids (ADC) and the calibration
+expression are all that is needed, so only those parts are parsed.
 """
 
 from __future__ import annotations
@@ -20,10 +21,12 @@ from pathlib import Path
 
 import awkward as ak
 import boost_histogram as bh
+import h5py
 import lh5
 import numexpr as ne
 import numpy as np
-from dbetto import TextDB
+import yaml
+from dbetto import AttrsDict, Props
 from dbetto.catalog import Catalog
 from lh5.io.exceptions import LH5DecodeError
 
@@ -59,6 +62,21 @@ PEAKS_SUMMARY = (2614.511, 583.191, 2103.511)
 ENERGY_PARAM = "cuspEmax_ctc_cal"
 #: Uncalibrated (ADC) input the calibration chain starts from.
 RAW_ENERGY = ENERGY_PARAM.removesuffix("_cal")
+
+#: ``results/ecal`` entries holding the ADC peak fits: ``par_hit`` stores them
+#: under the final step, ``par_pht`` under its per-run step.
+CAL_FITS = frozenset({ENERGY_PARAM, f"{RAW_ENERGY}_runcal"})
+
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+#: evt fields read per group, one read per group; flags nested a level deeper
+#: are read on their own.
+EVT_FIELDS = {
+    "trigger": ("timestamp", "is_forced"),
+    "coincident": ("puls", "muon", "muon_offline", "spms"),
+    "geds": ("multiplicity", "rawid", "energy"),
+}
+EVT_NESTED = ("geds/quality/is_bb_like", "geds/psd/is_bb_like")
 
 #: Calibration par tiers to look in, preferred first, per event tier:
 #: partitioned event data (``pet``) is calibrated by the partition-level
@@ -96,6 +114,45 @@ GROUP_UNIT_SECONDS = {
 }
 GROUP_UNIT_LABEL = {1: "rate (Hz / kg)", 3600: "rate (counts / hour / kg)"}
 
+MULT_SELECTIONS = {
+    "m = 0": lambda m: m == 0,
+    "m = 1": lambda m: m == 1,
+    "m = 2": lambda m: m == 2,
+    "m > 2": lambda m: m > 2,
+}
+
+
+def _both(a, b):
+    """``a & b``, or ``None`` if either is unavailable."""
+    return a & b if a is not None and b is not None else None
+
+
+def _not(a):
+    return None if a is None else ~a
+
+
+def _read_fields(group, handles, fields, prefix=""):
+    """``{"<prefix>/<field>": lgdo or None}`` for ``fields`` of ``group``.
+
+    One masked read of the group across the open files; if that fails,
+    field by field, so a missing field only disables its own series.
+    """
+    keys = {f: f"{prefix}/{f}" if prefix else f for f in fields}
+    if len(fields) > 1:
+        try:
+            tbl = lh5.read(group, handles, field_mask=list(fields))
+            if tbl is not None and all(f in tbl for f in fields):
+                return {keys[f]: tbl[f] for f in fields}
+        except (KeyError, LH5DecodeError, OSError, ValueError):
+            pass
+    out = {}
+    for f in fields:
+        try:
+            out[keys[f]] = lh5.read(f"{group}/{f}", handles)
+        except (KeyError, LH5DecodeError, OSError):
+            out[keys[f]] = None
+    return out
+
 
 def survival_fraction(pass_rate, fail_rate):
     """Per-bin fraction ``pass / (pass + fail)``, NaN where nothing was seen.
@@ -120,23 +177,37 @@ class ValidationData:
     # -- per-run reduction --------------------------------------------------
 
     def _columns(self, period, run):
-        """Read the needed evt columns of one run (not cached: reduced at once)."""
-        files = [str(f) for f in self.viewer._run_files(period, run)]
-        group = self.viewer.group
+        """Read the needed evt columns of one run (not cached: reduced at once).
 
-        def col(field):
-            return lh5.read(f"{group}/{field}", files)
+        Each of the run's ~150 files is opened once for all fields, not once
+        per field. Fields a cycle lacks come back as ``None``.
+        """
+        group = self.viewer.group
+        files = self.viewer._run_files(period, run)
+        if not files:
+            return {"timestamp": np.empty(0)}  # _summary skips an empty run
+        handles = []
+        try:
+            for f in files:
+                handles.append(h5py.File(f, "r", locking=False))
+            raw = {}
+            for sub, fields in EVT_FIELDS.items():
+                raw |= _read_fields(f"{group}/{sub}", handles, fields, prefix=sub)
+            for path in EVT_NESTED:
+                raw |= _read_fields(group, handles, (path,))
+        finally:
+            for h in handles:
+                h.close()
+        if raw["trigger/timestamp"] is None:
+            msg = f"no {group}/trigger/timestamp in {period} {run}"
+            raise KeyError(msg)
 
         def opt(field, conv):
-            # tolerate cycles without a field: the series is just absent
-            try:
-                return conv(col(field))
-            except (KeyError, LH5DecodeError, OSError):
-                return None
+            return None if raw[field] is None else conv(raw[field])
 
         as_bool = lambda o: o.nda.astype(bool)  # noqa: E731
         return {
-            "timestamp": col("trigger/timestamp").nda,  # required
+            "timestamp": raw["trigger/timestamp"].nda,
             "forced": opt("trigger/is_forced", as_bool),
             "puls": opt("coincident/puls", as_bool),
             "muon": opt("coincident/muon", as_bool),
@@ -153,79 +224,115 @@ class ValidationData:
         }
 
     @staticmethod
-    def _series_masks(d, hit_sel=None):
+    def _cuts(d):
+        """``(phys, cuts)``: the physics baseline and K-line cuts, per event.
+
+        Forced-trigger and pulser events are not physics. ``cuts`` maps each
+        K-line config but "after PSD" (a per-hit cut) to its event mask.
+        ``None`` marks an unavailable field.
+        """
+        phys = _both(_not(d["forced"]), _not(d["puls"]))
+        mult1 = None if d["mult"] is None else d["mult"] == 1
+        return phys, {
+            "before cuts": phys,
+            "after QC": _both(phys, d["qc"]),
+            "after mult = 1": _both(phys, mult1),
+            "after LAr": _both(phys, _not(d["spms"])),
+        }
+
+    @classmethod
+    def _series_masks(cls, d):
         """Per-event boolean masks for every rate series, ``None`` if unavailable.
 
-        All series except the raw trigger components exclude forced-trigger and
-        pulser events (they are not physics); the K-line configs additionally
-        apply one cut each on top of that baseline. ``hit_sel`` (a per-hit
-        boolean array, e.g. hits in one string) restricts every series to
-        events with a selected hit, and the K-line windows to the selected
-        hits themselves.
+        All series except the raw trigger components exclude non-physics
+        events; the K-line configs apply one cut each on top of that.
         """
-        n = len(d["timestamp"])
-        true = np.ones(n, dtype=bool)
-        has_hit = None if hit_sel is None else ak.to_numpy(ak.any(hit_sel, axis=1))
-
-        def both(a, b):
-            return a & b if a is not None and b is not None else None
-
-        def scoped(m):
-            return m if has_hit is None else both(m, has_hit)
-
-        phys = (
-            ~(d["forced"] | d["puls"])
-            if d["forced"] is not None and d["puls"] is not None
-            else None
-        )
+        phys, cuts = cls._cuts(d)
         masks = {
-            ("trigger", "all triggers"): scoped(true),
-            ("trigger", "forced"): scoped(d["forced"]),
-            ("trigger", "pulser"): scoped(d["puls"]),
-            ("trigger", "muon"): scoped(d["muon"]),
-            ("trigger", "muon offline"): scoped(d["muon_offline"]),
-            ("qc", "pass"): scoped(both(phys, d["qc"])),
-            ("qc", "fail"): scoped(
-                both(phys, ~d["qc"] if d["qc"] is not None else None)
-            ),
+            ("trigger", "all triggers"): np.ones(len(d["timestamp"]), dtype=bool),
+            ("trigger", "forced"): d["forced"],
+            ("trigger", "pulser"): d["puls"],
+            ("trigger", "muon"): d["muon"],
+            ("trigger", "muon offline"): d["muon_offline"],
+            ("qc", "pass"): _both(phys, d["qc"]),
+            ("qc", "fail"): _both(phys, _not(d["qc"])),
         }
-        for label, sel in (
-            ("m = 0", lambda m: m == 0),
-            ("m = 1", lambda m: m == 1),
-            ("m = 2", lambda m: m == 2),
-            ("m > 2", lambda m: m > 2),
-        ):
-            cond = sel(d["mult"]) if d["mult"] is not None else None
-            masks[("multiplicity", label)] = scoped(both(phys, cond))
+        for label, sel in MULT_SELECTIONS.items():
+            cond = None if d["mult"] is None else sel(d["mult"])
+            masks[("multiplicity", label)] = _both(phys, cond)
 
+        energy, psd = d["energy"], d["psd_bb"]
         for line, peak in K_LINES.items():
-            lo, hi = peak - LINE_WINDOW, peak + LINE_WINDOW
-            if d["energy"] is None:
-                in_line = in_line_psd = None
-            else:
-                # the in-window hit must itself be a selected (in-string) hit,
-                # so these masks need no extra has_hit scoping
-                e = d["energy"] if hit_sel is None else d["energy"][hit_sel]
-                in_line = ak.to_numpy(ak.any((e >= lo) & (e < hi), axis=1))
-                if d["psd_bb"] is None:
-                    in_line_psd = None
-                else:
-                    psd = d["psd_bb"] if hit_sel is None else d["psd_bb"][hit_sel]
-                    e_psd = e[psd]
-                    in_line_psd = ak.to_numpy(
-                        ak.any((e_psd >= lo) & (e_psd < hi), axis=1)
-                    )
-            base = both(phys, in_line)
-            masks[(line, "before cuts")] = base
-            masks[(line, "after QC")] = both(base, d["qc"])
-            masks[(line, "after mult = 1")] = both(
-                base, d["mult"] == 1 if d["mult"] is not None else None
-            )
-            masks[(line, "after LAr")] = both(
-                base, ~d["spms"] if d["spms"] is not None else None
-            )
-            masks[(line, "after PSD")] = both(phys, in_line_psd)
+            in_line = in_line_psd = None
+            if energy is not None:
+                win = (energy >= peak - LINE_WINDOW) & (energy < peak + LINE_WINDOW)
+                in_line = ak.to_numpy(ak.any(win, axis=1))
+                if psd is not None:
+                    in_line_psd = ak.to_numpy(ak.any(win[psd], axis=1))
+            for config, cut in cuts.items():
+                masks[(line, config)] = _both(cut, in_line)
+            masks[(line, "after PSD")] = _both(phys, in_line_psd)
         return masks
+
+    @classmethod
+    def _string_hists(cls, d, masks, axis, string_rawids):
+        """Every series per string, as ``(time, string)`` histograms.
+
+        An event counts toward a string when it has a hit there -- for the
+        K-lines, an in-window hit there. One hit -> string lookup serves all
+        strings, instead of re-deriving every mask per string. ``None``
+        without ``geds/rawid``.
+        """
+        rawid = d.get("rawid")
+        strings = sorted(string_rawids)
+        lut = {r: i for i, s in enumerate(strings) for r in string_rawids[s]}
+        if rawid is None or not lut:
+            return None
+        keys = np.array(sorted(lut), dtype=np.int64)
+        flat = ak.to_numpy(ak.flatten(rawid)).astype(np.int64)
+        pos = np.minimum(np.searchsorted(keys, flat), keys.size - 1)
+        known = keys[pos] == flat  # hits of unmapped channels drop out
+        hit_str = np.array([lut[k] for k in keys], dtype=np.int64)[pos]
+        hit_evt = np.repeat(np.arange(len(rawid)), ak.to_numpy(ak.num(rawid)))
+        t, values, ns = d["timestamp"], np.asarray(strings), len(strings)
+
+        def pairs(hit_mask=None):
+            # (event, string index) once per pair, from the selected hits
+            sel = known if hit_mask is None else known & hit_mask
+            pair = np.unique(hit_evt[sel] * ns + hit_str[sel])
+            return pair // ns, pair % ns
+
+        def fill(ev_st, evt_mask):
+            if evt_mask is None:
+                return None
+            ev, st = ev_st
+            keep = evt_mask[ev]
+            h = bh.Histogram(axis, bh.axis.IntCategory(strings))
+            h.fill(t[ev[keep]], values[st[keep]])
+            return h
+
+        any_hit = pairs()
+        hists = {k: fill(any_hit, m) for k, m in masks.items() if k[0] not in K_LINES}
+        phys, cuts = cls._cuts(d)
+        energy, psd = d["energy"], d["psd_bb"]
+        flat_e = flat_psd = None
+        if energy is not None:
+            flat_e = ak.to_numpy(ak.flatten(energy)).astype(float)
+            if flat_e.size != flat.size:
+                flat_e = None  # energy and rawid not hit-aligned: no K-lines
+        if psd is not None and flat_e is not None:
+            flat_psd = ak.to_numpy(ak.flatten(psd)).astype(bool)
+        for line, peak in K_LINES.items():
+            win = None
+            if flat_e is not None:
+                win = (flat_e >= peak - LINE_WINDOW) & (flat_e < peak + LINE_WINDOW)
+            in_line = None if win is None else pairs(win)
+            for config, cut in cuts.items():
+                hists[(line, config)] = None if in_line is None else fill(in_line, cut)
+            hists[(line, "after PSD")] = (
+                None if flat_psd is None else fill(pairs(win & flat_psd), phys)
+            )
+        return hists
 
     def _string_map(self, period, run):
         """Per-string ged rawids and masses from the run's channelmap.
@@ -271,23 +378,13 @@ class ValidationData:
                 continue
         return []
 
-    def _hit_selection(self, d, period, run, string):
-        """Per-hit boolean mask marking hits in ``string`` (ak, VoV layout)."""
-        if d["rawid"] is None:
-            msg = "this cycle's evt tier has no geds/rawid; cannot select a string"
-            raise ValueError(msg)
-        rawids = self._string_map(period, run)[0].get(string, frozenset())
-        flat = np.isin(
-            ak.flatten(d["rawid"]).to_numpy(),
-            np.fromiter(rawids, dtype=np.int64, count=len(rawids)),
-        )
-        return ak.unflatten(flat, ak.num(d["rawid"]))
+    def _summary(self, period, run):
+        """Binned counts of one run at base resolution, for every scope.
 
-    def _summary(self, period, run, string=None):
-        """Binned counts of one run at base resolution.
-
-        Shared across sessions: the entries are KB-scale but each is the
-        reduction of a whole run's evt columns, so building one is the
+        ``series`` holds the whole-array histograms, ``strings`` the same
+        series per string as ``(time, string)`` histograms (``None`` without
+        ``geds/rawid``). Shared across sessions: an entry is ~2 MB but each is
+        the reduction of a whole run's evt columns, so building one is the
         expensive part of a first visit to the Validation tab.
         """
         files = tuple(str(f) for f in self.viewer._run_files(period, run))
@@ -297,23 +394,25 @@ class ValidationData:
             t = d["timestamp"]
             if t.size == 0:
                 return None
-            hit_sel = (
-                None if string is None else self._hit_selection(d, period, run, string)
-            )
             # day-aligned absolute axis: every BIN_WIDTHS factor divides it
             # exactly, and bins of different runs line up with each other
             t0 = math.floor(t.min() / _DAY) * _DAY
             t1 = math.ceil(t.max() / _DAY) * _DAY
             t1 = max(t1, t0 + _DAY)
             axis = bh.axis.Regular(int((t1 - t0) / BASE_BIN_SECONDS), t0, t1)
+            masks = self._series_masks(d)
             series = {}
-            for skey, mask in self._series_masks(d, hit_sel).items():
+            for skey, mask in masks.items():
                 if mask is None:
                     series[skey] = None
                     continue
                 h = bh.Histogram(axis)
                 h.fill(t[mask])
                 series[skey] = h
+            strings = None
+            if d.get("rawid") is not None:
+                string_rawids = self._string_map(period, run)[0]
+                strings = self._string_hists(d, masks, axis, string_rawids)
             # seconds of data coverage per bin (clipped overlap with the
             # run's [first, last] timestamp); gaps between the run's DAQ
             # cycles are not subtracted -- rates average over them
@@ -324,10 +423,27 @@ class ValidationData:
                 0.0,
                 None,
             )
-            return {"series": series, "exposure": exposure}
+            return {"series": series, "strings": strings, "exposure": exposure}
 
-        key = (self.viewer.cycle_key, period, run, files, string)
+        key = (self.viewer.cycle_key, period, run, files)
         return VALIDATION_SUMMARIES.get(key, build)
+
+    @staticmethod
+    def _scope_counts(summary, key, string, factor):
+        """Base counts of series ``key`` in scope, rebinned (``None`` if absent)."""
+        if string is None:
+            h = summary["series"][key]
+            return None if h is None else h[:: bh.rebin(factor)].view()
+        if summary["strings"] is None:
+            msg = "this cycle's evt tier has no geds/rawid; cannot select a string"
+            raise ValueError(msg)
+        h = summary["strings"][key]
+        if h is None:
+            return None
+        h = h[:: bh.rebin(factor), :]
+        if string not in list(h.axes[1]):
+            return np.zeros(h.axes[0].size)  # no such string in this run
+        return h[:, bh.loc(string)].view()
 
     # -- period assembly ------------------------------------------------------
 
@@ -355,7 +471,7 @@ class ValidationData:
         chunks: dict = {k: [] for k in all_keys}
 
         for run in sorted(self.viewer.available_runs().get(period, {})):
-            summary = self._summary(period, run, string)
+            summary = self._summary(period, run)
             if summary is None:
                 continue
             mass = self._mass_kg(period, run, string)
@@ -374,11 +490,11 @@ class ValidationData:
                 times.append(np.array([(centers[0] - bin_seconds) * 1000.0]))
             times.append(centers * 1000.0)
             for k in all_keys:
-                h = summary["series"][k]
-                if h is None:
+                counts = self._scope_counts(summary, k, string, factor)
+                if counts is None:
                     chunks[k].append(np.full(exp_v.size, np.nan))
                     continue
-                counts = h[:: bh.rebin(factor)].view()[sl].astype(float)
+                counts = counts[sl].astype(float)
                 unit = GROUP_UNIT_SECONDS[k[0]]
                 chunks[k].append(counts / exp_v * unit / mass)
 
@@ -459,17 +575,18 @@ class ValidationData:
     def load_cal_source(self, source):
         """``(pars, label)`` for one entry of :meth:`cal_par_sources`.
 
-        Loaded through dbetto's ``TextDB``, which merges the listed files the
-        way the dataflow does. Shared across sessions: these files are
-        MB-scale and take ~0.7 s to parse, and every session looking at this
-        run wants the same ones.
+        The listed files are merged in order with dbetto's ``Props.add_to``,
+        as ``TextDB.on`` does, but only their calibration part is parsed (see
+        :func:`_read_cal_yaml`). Shared across sessions: every session
+        looking at this run wants the same ones.
         """
-        tier, root, category, start_key, files = source
+        tier, root, _category, _start_key, files = source
 
         def load():
-            return TextDB(root, lazy=True).on(
-                start_key, pattern=rf".*par_{tier}\.yaml$", category=category
-            )
+            pars = AttrsDict()
+            for f in files:
+                pars = Props.add_to(pars, _read_cal_yaml(root / f))
+            return pars
 
         # keyed by the resolved files, not the start key: every run the same
         # validity entry covers shares one parse
@@ -497,6 +614,61 @@ class ValidationData:
             return entry["start_key"]
         tstamps = self.viewer._run_tstamps(period, run)
         return tstamps[0] if tstamps else None
+
+
+# -- par file reading ------------------------------------------------------------
+
+
+def _slim_cal_yaml(text):
+    """The lines of a par YAML that the calibration plots read.
+
+    Keeps each detector's ``pars/operations`` and its ``results/ecal``
+    entries in ``CAL_FITS``, relying on the dataflow's block-style dump
+    (2-space indent, one key per line). That is 10-30% of a file.
+    """
+    out, path = [], [None] * 4  # detector, pars|results, section, entry
+    for line in text.splitlines(keepends=True):
+        body = line.lstrip(" ")
+        if not body.strip():
+            continue
+        level = (len(line) - len(body)) // 2
+        if level < 4 and not body.startswith("- ") and ":" in body:
+            path[level] = body.split(":", 1)[0]
+            path[level + 1 :] = [None] * (3 - level)
+        top = (path[1], path[2])
+        if (
+            (level <= 1 and path[1] in (None, "pars", "results"))
+            or (level == 2 and top in {("pars", "operations"), ("results", "ecal")})
+            or (level >= 3 and top == ("pars", "operations"))
+            or (level >= 3 and top == ("results", "ecal") and path[3] in CAL_FITS)
+        ):
+            out.append(line)
+    return "".join(out)
+
+
+def _has_fits(pars):
+    """Whether any detector in ``pars`` has a ``CAL_FITS`` entry."""
+    for det in pars.values():
+        results = det.get("results") if isinstance(det, dict) else None
+        ecal = results.get("ecal") if isinstance(results, dict) else None
+        if isinstance(ecal, dict) and set(ecal) & CAL_FITS:
+            return True
+    return False
+
+
+def _read_cal_yaml(path):
+    """The calibration part of one par YAML (see :func:`_slim_cal_yaml`).
+
+    Falls back to parsing the whole file when the slim parse fails or finds
+    no peak fits, so a layout change costs speed, never the plot.
+    """
+    try:
+        pars = yaml.load(_slim_cal_yaml(Path(path).read_text()), Loader=_YAML_LOADER)
+        if isinstance(pars, dict) and _has_fits(pars):
+            return pars
+    except yaml.YAMLError:
+        pass
+    return Props.read_from(str(path))
 
 
 # -- calibration curve math (pure functions over a parsed par_hit/pht dict) ----

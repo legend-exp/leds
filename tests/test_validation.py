@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import awkward as ak
+import boost_histogram as bh
 import numpy as np
 import pytest
 import yaml
@@ -12,6 +13,7 @@ from leds.validation import (
     BIN_WIDTHS,
     K_LINES,
     ValidationData,
+    _read_cal_yaml,
     cal_curve,
     cal_residuals,
     survival_fraction,
@@ -191,7 +193,7 @@ def test_string_scoping_and_mass_normalisation():
     )
 
     def n(string, key):
-        return data._summary("p01", "r001", string)["series"][key].view().sum()
+        return data._summary("p01", "r001")["strings"][key][:, bh.loc(string)].sum()
 
     # events count toward a string only when they have a hit in it
     assert n(1, ("trigger", "all triggers")) == 2  # e0, e2
@@ -334,6 +336,47 @@ def test_cal_residuals_order_and_nan():
     np.testing.assert_allclose(res, 0.0, atol=1e-9)
     res583, _ = residuals[583.191]
     assert np.isnan(res583).all()  # only invalid fits for that peak
+
+
+def bulky_pars():
+    """synthetic_pars plus the sections a real par file carries but we skip."""
+    pars = synthetic_pars()
+    det = pars["V01"]
+    det["pars"]["dsp_config"] = {"filters": ["cusp", "zac"], "tau": 400.0}
+    det["results"]["aoe"] = {"default": {"cut": [1.0, 2.0], "pk_fits": {"1": 2}}}
+    det["results"]["ecal"]["zacEmax_ctc_cal"] = {"pk_fits": {"2614.511": {"a": 1}}}
+    det["results"]["ecal"]["cuspEmax_ctc_cal"]["eres_linear"] = {"pars": [0.1, 0.2]}
+    pars["V02"] = {"pars": {"operations": {}}}  # an off detector: no results
+    return pars
+
+
+def test_slim_cal_yaml_keeps_what_the_plots_read(tmp_path):
+    f = tmp_path / "par_hit.yaml"
+    f.write_text(yaml.safe_dump(bulky_pars(), sort_keys=False))
+
+    slim = _read_cal_yaml(f)
+
+    full = yaml.safe_load(f.read_text())
+    assert slim["V01"]["pars"]["operations"] == full["V01"]["pars"]["operations"]
+    assert slim["V01"]["results"]["ecal"] == {
+        "cuspEmax_ctc_cal": full["V01"]["results"]["ecal"]["cuspEmax_ctc_cal"]
+    }
+    assert "aoe" not in slim["V01"]["results"]
+    assert "dsp_config" not in slim["V01"]["pars"]
+    assert slim["V02"] == full["V02"]
+    np.testing.assert_allclose(
+        cal_curve(slim, "V01")["residual"], cal_curve(full, "V01")["residual"]
+    )
+
+
+def test_read_cal_yaml_falls_back_on_an_unexpected_layout(tmp_path):
+    f = tmp_path / "par_hit.yaml"
+    f.write_text(yaml.safe_dump(synthetic_pars(), indent=4))  # not the dump layout
+
+    pars = _read_cal_yaml(f)
+
+    assert pars["V01"]["results"]["ecal"]["cuspEmax_ctc_cal"]["pk_fits"]
+    assert cal_curve(pars, "V01")["peaks"].size == 2
 
 
 def write_par_tier(root, tier, files, *, category=None, pars=None):
