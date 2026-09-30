@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.resources
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -471,6 +472,18 @@ class EventDisplay(param.Parameterized):
         self._validation_poll = None  # periodic redraw while a plot's data builds
         self._cal_grid = None  # (key, spectra, err, match) of the drawn grid
         self._validation_building = False
+        self._validation_drawn_at = 0.0  # monotonic time of the last redraw
+        # how much of the shown plot's data is read, while it is being read
+        self.validation_progress_text = pn.pane.HTML("", margin=(4, 10, 0, 10))
+        self.validation_progress_bar = pn.indicators.Progress(
+            value=0, max=1, bar_color="info", height=14, sizing_mode="stretch_width"
+        )
+        self.validation_progress_row = pn.Row(
+            self.validation_progress_text,
+            self.validation_progress_bar,
+            visible=False,
+            sizing_mode="stretch_width",
+        )
         self.validation_tab = pn.Column(
             pn.Row(
                 pn.widgets.Select.from_param(
@@ -482,6 +495,7 @@ class EventDisplay(param.Parameterized):
                 self.validation_detector_select,
             ),
             self.validation_sections_row,
+            self.validation_progress_row,
             self.validation_area,
             sizing_mode="stretch_width",
             min_height=600,
@@ -1229,6 +1243,7 @@ class EventDisplay(param.Parameterized):
         # re-read the state: building a calibration plot can re-point
         # validation_detector at the run's first detector
         self._tab_drawn(TAB_VALIDATION, self._validation_state())
+        self._validation_drawn_at = time.monotonic()
         self._sync_validation_poll()
 
     def _show_validation_note(self, text):
@@ -1270,17 +1285,27 @@ class EventDisplay(param.Parameterized):
             )
             return _note_progress(fig, progress)
         if plot == "qc failing flags":
-            counts = self.validation_data.period_qc_flags(self.period)
+            counts, progress = self.validation_data.period_qc_flags(
+                self.period, wait=not self._progressive
+            )
+            built, runs, _errors = progress
+            self._validation_building = built < runs
             if counts is None:
                 msg = "this cycle's evt tier has no geds/quality/is_not_bb_like"
+                if built < runs:
+                    msg = (
+                        f"reading the QC flags of {self.period}: {built} of {runs} "
+                        "runs done; the plot appears as they finish"
+                    )
                 raise _Unavailable(msg)
             config = self.viewer.paths.get("config")
             tables = validation.qc_bit_tables(str(config)) if config else {}
             flags, table = validation.qc_flag_table(counts, tables)
             rows = self.validation_data.ged_rows(self.period)
-            return validation_view.qc_failing_flags(
+            fig = validation_view.qc_failing_flags(
                 rows, flags, table, counts, self.period
             )
+            return _note_progress(fig, progress)
         if plot == "calibration check":
             return self._cal_check_figure()
         if plot in validation_view.RATE_BUILDERS:
@@ -1388,6 +1413,8 @@ class EventDisplay(param.Parameterized):
                     string = -1  # any string: needs the full summaries
                 keys = None if plot == "qc survival by string" else _plot_keys(plot)
                 return self.validation_data.summaries_ready(period, string, keys)
+            if plot == "qc failing flags":
+                return self.validation_data.qc_flags_ready(period)
             if plot == "calibration check":
                 name = (
                     self.validation_detector if self.validation_cal_sections else None
@@ -1396,6 +1423,35 @@ class EventDisplay(param.Parameterized):
         except Exception:  # the figure reports it
             return None
         return None
+
+    def _progress_bar_state(self):
+        """``(label, done, total)`` for the progress bar, from the plot's progress."""
+        progress = self._validation_progress()
+        if not progress:
+            return None
+        plot = self.validation_plot
+        if plot == "calibration check":
+            uncut, cuts, n = progress
+            if uncut < n:
+                return "reading the cal runs", uncut, n
+            if self.validation_cal_sections:
+                return f"section data for {self.validation_detector}", cuts, n
+            return None
+        built, runs = progress
+        what = "QC flags" if plot == "qc failing flags" else "runs"
+        return f"reading the {what} of {self.period}", built, runs
+
+    def _update_progress_bar(self):
+        """Show the bar while the shown plot's data is still being read."""
+        state = self._progress_bar_state() if self._progressive else None
+        if state is None or state[1] >= state[2]:
+            self.validation_progress_row.visible = False
+            return
+        label, done, total = state
+        self.validation_progress_bar.max = total
+        self.validation_progress_bar.value = done
+        self.validation_progress_text.object = f"{label}: {done} of {total}"
+        self.validation_progress_row.visible = True
 
     def _cal_check_figure(self):
         """Calibration check of every cal run in the period, from what is built."""
@@ -1467,11 +1523,12 @@ class EventDisplay(param.Parameterized):
         self.validation_cal_sections = []
 
     def _sync_validation_poll(self):
-        """Redraw every 5 s while the shown plot's data is still building."""
+        """Tick every 2 s while the shown plot's data is still building."""
+        self._update_progress_bar()
         if self._validation_building and pn.state.curdoc is not None:
             if self._validation_poll is None:
                 self._validation_poll = pn.state.add_periodic_callback(
-                    self._poll_validation, period=5000
+                    self._poll_validation, period=2000
                 )
         elif self._validation_poll is not None:
             self._validation_poll.stop()
@@ -1479,12 +1536,22 @@ class EventDisplay(param.Parameterized):
 
     @_serialized
     def _poll_validation(self):
-        """Redraw if more is built; the progress is part of the state."""
+        """Move the progress bar; redraw the plot when enough more is built.
+
+        The bar follows every finished run, the plot at most every ~6 s (and
+        once when all is built), since a redraw costs more than the bar.
+        """
         if self.tabs.active != TAB_VALIDATION:
             self._validation_building = False
             self._sync_validation_poll()
             return
-        self._guarded("validation", self._update_validation)
+        self._update_progress_bar()
+        if self._tab_is_current(TAB_VALIDATION, self._validation_state()):
+            return
+        state = self._progress_bar_state()
+        finished = state is None or state[1] >= state[2]
+        if finished or time.monotonic() - self._validation_drawn_at >= 6:
+            self._guarded("validation", self._update_validation)
 
     def _refresh_validation_strings(self):
         """Offer the period's strings in the scope selector."""

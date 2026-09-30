@@ -482,7 +482,11 @@ class ValidationData:
                 continue
         return []
 
-    def _qc_flag_counts(self, period, run):
+    def _qc_flag_key(self, period, run):
+        files = tuple(map(str, self.viewer._run_files(period, run)))
+        return ("qc_flags", self.viewer.cycle_key, period, run, files)
+
+    def _qc_flag_counts(self, period, run, wait=True):
         """Per detector, how often each QC bit is unset, over physics events.
 
         Returns ``{"events": physics events, "failing": {rawid: failing hits},
@@ -490,7 +494,8 @@ class ValidationData:
         largest stored bitmask}, "discharge": delayed-discharge events}``, or
         ``None`` without the ``is_not_bb_like`` fields. Only QC-failing hits
         carry bitmasks. A pass of its own over the files, cached like
-        :meth:`_summary`, so the rate plots never read these fields.
+        :meth:`_summary`, so the rate plots never read these fields. With
+        ``wait=False``, ``_NOT_BUILT`` until built (queued in the background).
         """
         files = self.viewer._run_files(period, run)
 
@@ -542,14 +547,40 @@ class ValidationData:
                 out["discharge"] = int((dd.nda.astype(bool) & keep).sum())
             return out
 
-        key = ("qc_flags", self.viewer.cycle_key, period, run, tuple(map(str, files)))
-        return VALIDATION_SUMMARIES.get(key, build)
+        key = self._qc_flag_key(period, run)
+        if wait:
+            return VALIDATION_SUMMARIES.get(key, build)
+        value = VALIDATION_SUMMARIES.peek(key, _NOT_BUILT)
+        if value is _NOT_BUILT:
+            VALIDATION_SUMMARIES.build_later(key, build)
+        return value
 
-    def period_qc_flags(self, period):
-        """:meth:`_qc_flag_counts` summed over every run of ``period``."""
-        total = None
-        for run in sorted(self.viewer.available_runs().get(period, {})):
-            part = self._qc_flag_counts(period, run)
+    def qc_flags_ready(self, period):
+        """``(built, runs)`` of the period's QC flag counts."""
+        runs = sorted(self.viewer.available_runs().get(period, {}))
+        built = sum(
+            VALIDATION_SUMMARIES.peek(self._qc_flag_key(period, r), _NOT_BUILT)
+            is not _NOT_BUILT
+            for r in runs
+        )
+        return built, len(runs)
+
+    def period_qc_flags(self, period, wait=True):
+        """:meth:`_qc_flag_counts` summed over every run of ``period``.
+
+        Returns ``(counts, (built, runs, errors))``. With ``wait=False`` only
+        the runs built so far are summed; the rest are queued.
+        """
+        total, built, errors = None, 0, []
+        runs = sorted(self.viewer.available_runs().get(period, {}))
+        for run in runs:
+            part = self._qc_flag_counts(period, run, wait)
+            if part is _NOT_BUILT:
+                continue
+            built += 1
+            if isinstance(part, dict) and "error" in part:
+                errors.append(f"{run}: {part['error']}")
+                continue
             if part is None:
                 continue
             if total is None:
@@ -565,7 +596,7 @@ class ValidationData:
                 total["max"][name] = max(total["max"].get(name, 0), part["max"][name])
             if part["discharge"] is not None and total["discharge"] is not None:
                 total["discharge"] += part["discharge"]
-        return total
+        return total, (built, len(runs), errors)
 
     def _summary_key(self, period, run):
         files = tuple(str(f) for f in self.viewer._run_files(period, run))
