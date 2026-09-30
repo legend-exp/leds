@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from dbetto import AttrsDict, Props
@@ -12,6 +13,11 @@ CONFIG_FILENAME = "dataflow-config.yaml"
 #: explicit ``base_path`` is given. Lets the hosted (Docker/spin) instance and a
 #: local user select their data without code changes.
 ENV_BASE_PATH = "LEDS_BASE_PATH"
+
+#: Kinds of production cycle, in dropdown order, named by the directory that
+#: holds them: ``prod-blind/ref/v2.1.0``, ``prod-blind/tmp/v2.1.0dev1``,
+#: ``prod-blind/auto/latest``.
+CYCLE_KINDS = ("ref", "tmp", "auto")
 
 
 def resolve_base_path(base_path: str | os.PathLike | None = None) -> Path:
@@ -83,6 +89,18 @@ def list_cycles(base_path: str | os.PathLike | None = None) -> list[str]:
     )
 
 
+def cycle_kind(path: str | os.PathLike) -> str | None:
+    """The cycle's kind (one of ``CYCLE_KINDS``) from its parent directory."""
+    kind = Path(path).parent.name
+    return kind if kind in CYCLE_KINDS else None
+
+
+def _natural_key(name: str) -> list:
+    # "v2.10.0" after "v2.9.0": digit runs compare as numbers (re.split with a
+    # group alternates str/int from a str, so positions always compare alike)
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
 def discover_cycles(
     base_path: str | os.PathLike | list | None = None,
 ) -> dict[str, Path]:
@@ -90,9 +108,13 @@ def discover_cycles(
 
     Each base path is scanned for sub-directories holding a
     ``dataflow-config.yaml``; a base path that is itself a cycle (has the config
-    at its root) is included directly. Labels are the cycle directory names,
-    qualified with the parent directory name only when two cycles would
-    otherwise collide.
+    at its root) is included directly.
+
+    A cycle inside a ``ref``/``tmp``/``auto`` directory is labelled
+    ``<kind>/<name>`` (the same version can exist as both ref and tmp); any
+    other by its directory name, qualified with the parent's name only when
+    two would collide. Ordered by kind (``CYCLE_KINDS``, then unclassified),
+    newest first within each, so the first is the newest ref cycle.
     """
     cycles: dict[str, Path] = {}
     for root in resolve_base_paths(base_path):
@@ -102,11 +124,37 @@ def discover_cycles(
         if not found and (root / CONFIG_FILENAME).is_file():
             found = [root]  # the base path is itself a single cycle
         for cdir in found:
-            label = cdir.name
+            kind = cycle_kind(cdir)
+            label = f"{kind}/{cdir.name}" if kind else cdir.name
             if label in cycles and cycles[label] != cdir:
                 label = f"{cdir.parent.name}/{cdir.name}"
+                if kind:
+                    label = f"{cdir.parent.parent.name}/{label}"
             cycles[label] = cdir
-    return cycles
+
+    def kind_rank(item):
+        kind = cycle_kind(item[1])
+        return CYCLE_KINDS.index(kind) if kind else len(CYCLE_KINDS)
+
+    items = sorted(
+        cycles.items(), key=lambda kv: _natural_key(kv[1].name), reverse=True
+    )
+    items.sort(key=kind_rank)  # stable: stays newest first within a kind
+    return dict(items)
+
+
+def cycle_groups(cycles: dict[str, Path]) -> dict[str, list[str]] | None:
+    """Dropdown sections ``{kind: [label, ...]}`` for ``cycles``.
+
+    In the order of ``cycles`` (see :func:`discover_cycles`), with the
+    unclassified ones under "other". Options keep their full ``ref/v2.1.0``
+    label so the closed dropdown still says which kind is selected. ``None``
+    when no cycle has a kind, so a plain local cycle keeps a plain dropdown.
+    """
+    groups: dict[str, list[str]] = {}
+    for label, path in cycles.items():
+        groups.setdefault(cycle_kind(path) or "other", []).append(label)
+    return None if set(groups) <= {"other"} else groups
 
 
 def load_paths(base_path: str | os.PathLike | None = None) -> AttrsDict:
