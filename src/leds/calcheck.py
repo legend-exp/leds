@@ -202,7 +202,7 @@ def scale_match(spectra, reference=None):
 
 def coarsen(spectrum, width=DISPLAY_BIN):
     """Sum 0.5 keV bins into ``width`` keV bins."""
-    k = int(round(width / BIN))
+    k = round(width / BIN)
     return np.asarray(spectrum)[: N_BINS // k * k].reshape(-1, k).sum(axis=1)
 
 
