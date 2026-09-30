@@ -269,7 +269,9 @@ def test_qc_flag_counts_and_names(monkeypatch):
     monkeypatch.setattr(validation_mod, "_read_groups", lambda *_a, **_k: raw)
     data = ValidationData(FakeViewer(runs={"p01": {"r001": ["ts"]}}))
 
-    counts = data.period_qc_flags("p01")
+    counts, progress = data.period_qc_flags("p01")
+
+    assert progress == (1, 1, [])
 
     assert counts["events"] == 2  # the forced event is left out
     assert counts["failing"] == {101: 2, 201: 1}
