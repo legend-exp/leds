@@ -121,6 +121,15 @@ QC_CLASSES = {
     "is_highly_pos_polarity_bits": "is_highly_positive_polarity_candidate",
 }
 QC_MAX_BITS = 16  # bits counted per class; the tables use at most 10
+#: Tie order when a failing hit is equally close to several classes: a
+#: normal pulse is then not blamed on a class selector (is_low_cuspEmax,
+#: is_valid_trap_tpmin, ...).
+QC_TIE_ORDER = (
+    "is_highly_pos_polarity_bits",
+    "is_pos_polarity_bits",
+    "is_empty_bits",
+    "is_neg_polarity_bits",
+)
 
 #: Calibration par tiers to look in, preferred first, per event tier:
 #: partitioned event data (``pet``) is calibrated by the partition-level
@@ -251,27 +260,81 @@ def qc_bit_tables(config_root):
     return {}
 
 
-def qc_flag_table(counts, tables):
-    """Name the unset-bit counts of :meth:`ValidationData.period_qc_flags`.
+def _qc_reasons(raw, keep, n_hits, inverse, ids, tables):
+    """Why each QC-failing hit failed: ``(flags, {rawid: {flag: hits}})``.
 
-    Returns ``(flags, {rawid: {flag: count}})``. A flag in several classes is
-    the same stored boolean in each, so its first class is used. A class
-    whose table is missing, or narrower than its stored bitmasks, is labelled
-    ``"<class> bit N"`` instead.
+    A hit passes QC when it is a valid waveform of any of the four classes
+    (empty, negative, positive, highly positive polarity), each a set of
+    flags. It fails when every class misses at least one flag. Its reasons
+    are the missing flags of the class it came closest to passing (fewest
+    missing; ties by ``QC_TIE_ORDER``): counting every unset flag would blame
+    the class selectors, e.g. ``is_valid_trap_tpmin`` is unset on nearly every
+    positive pulse. Classes stored as NaN carry no information and are
+    skipped; a class without a usable bit table gets ``"<class> bit N"``.
     """
-    flags, values = [], {}
-    for name, per_rawid in counts["bits"].items():
-        width = max(counts["max"].get(name, 0).bit_length(), 1)
-        table = tables.get(name)
-        if not table or len(table) < width:
-            table = [f"{name.removesuffix('_bits')} bit {b}" for b in range(width)]
-        for bit, flag in enumerate(table):
-            if flag in flags:
-                continue
-            flags.append(flag)
-            for rid, unset in per_rawid.items():
-                values.setdefault(rid, {})[flag] = int(unset[bit])
-    return flags, values
+    nbb = "geds/quality/is_not_bb_like"
+    classes = []  # (class, flag names, unset bits (n, width), missing or inf)
+    for name in QC_TIE_ORDER:
+        arr = raw.get(f"{nbb}/{name}")
+        if arr is None:
+            continue
+        flat = ak.to_numpy(ak.flatten(arr.view_as("ak")[keep]))
+        if flat.size != n_hits:
+            continue  # not hit-aligned with the rawids
+        known = np.isfinite(flat) if flat.dtype.kind == "f" else np.ones(n_hits, bool)
+        if not known.any():
+            continue
+        vals = np.where(known, flat, 0).astype(np.int64)
+        width = max(int(vals.max()).bit_length(), 1)
+        names = tables.get(name)
+        if not names or len(names) < width:
+            names = [f"{name.removesuffix('_bits')} bit {b}" for b in range(width)]
+        unset = ((vals[:, None] >> np.arange(len(names))) & 1) == 0
+        missing = np.where(known, unset.sum(axis=1), np.inf)
+        classes.append((name, names, unset, missing))
+    reasons: dict = {}
+    order = {}  # flag -> column position: classes in QC_CLASSES order
+    for name in QC_CLASSES:
+        for cls, names, _u, _m in classes:
+            if cls == name:
+                for flag in names:
+                    order.setdefault(flag, len(order))
+    if not classes:
+        return [], reasons
+    best = np.argmin(np.stack([c[3] for c in classes], axis=1), axis=1)
+    for k, (_cls, names, unset, missing) in enumerate(classes):
+        sel = (best == k) & np.isfinite(missing)
+        for j, flag in enumerate(names):
+            counts = np.bincount(inverse[sel], unset[sel, j], ids.size)
+            for i in np.flatnonzero(counts):
+                per = reasons.setdefault(int(ids[i]), {})
+                per[flag] = per.get(flag, 0) + int(counts[i])
+    return sorted(order, key=order.get), reasons
+
+
+def qc_flag_table(counts):
+    """``(flags, {rawid: {flag: failing hits it caused}})`` of QC flag counts."""
+    return counts["flags"], counts["reasons"]
+
+
+def top_failures(counts, n=10):
+    """The ``n`` detectors of one run failing QC most, each with its leading flag.
+
+    Ranked by QC-failing hits per physics event. Returns ``[(rawid, failing
+    hits, fraction of physics events, leading flag, share of the detector's
+    failing hits it caused)]``; the flag is ``None`` when the bitmasks carry
+    no information. See :func:`_qc_reasons` for what counts as a cause.
+    """
+    _flags, table = qc_flag_table(counts)
+    events = max(counts["events"], 1)
+    ranked = sorted(counts["failing"].items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+    out = []
+    for rid, failing in ranked:
+        row = table.get(rid, {})
+        lead = max(row, key=row.get) if row and max(row.values()) > 0 else None
+        share = row[lead] / failing if lead else np.nan
+        out.append((rid, failing, failing / events, lead, share))
+    return out
 
 
 class ValidationData:
@@ -484,20 +547,25 @@ class ValidationData:
 
     def _qc_flag_key(self, period, run):
         files = tuple(map(str, self.viewer._run_files(period, run)))
-        return ("qc_flags", self.viewer.cycle_key, period, run, files)
+        return ("qc_reasons", self.viewer.cycle_key, period, run, files)
+
+    def _qc_tables(self):
+        config = getattr(self.viewer, "paths", {}).get("config")
+        return qc_bit_tables(str(config)) if config else {}
 
     def _qc_flag_counts(self, period, run, wait=True):
-        """Per detector, how often each QC bit is unset, over physics events.
+        """Per detector, why its hits fail QC, over physics events.
 
         Returns ``{"events": physics events, "failing": {rawid: failing hits},
-        "bits": {class: {rawid: (QC_MAX_BITS,) unset counts}}, "max": {class:
-        largest stored bitmask}, "discharge": delayed-discharge events}``, or
-        ``None`` without the ``is_not_bb_like`` fields. Only QC-failing hits
-        carry bitmasks. A pass of its own over the files, cached like
+        "flags": [flag names], "reasons": {rawid: {flag: failing hits it
+        caused}}, "discharge": delayed-discharge events}``, or ``None``
+        without the ``is_not_bb_like`` fields. See :func:`_qc_reasons` for
+        how a failing hit's reasons are chosen. A pass of its own over the files, cached like
         :meth:`_summary`, so the rate plots never read these fields. With
         ``wait=False``, ``_NOT_BUILT`` until built (queued in the background).
         """
         files = self.viewer._run_files(period, run)
+        tables = self._qc_tables()
 
         def build():
             raw = _read_groups(self.viewer.group, files, QC_FLAG_FIELDS)
@@ -513,35 +581,14 @@ class ValidationData:
             ids, inverse, n_fail = np.unique(
                 rid, return_inverse=True, return_counts=True
             )
+            flags, reasons = _qc_reasons(raw, keep, rid.size, inverse, ids, tables)
             out = {
                 "events": int(keep.sum()),
                 "failing": dict(zip(ids.tolist(), n_fail.tolist(), strict=True)),
-                "bits": {},
-                "max": {},
+                "flags": flags,
+                "reasons": reasons,
                 "discharge": None,
             }
-            for name in QC_CLASSES:
-                arr = raw.get(f"{nbb}/{name}")
-                if arr is None:
-                    continue
-                flat = ak.to_numpy(ak.flatten(arr.view_as("ak")[keep]))
-                if flat.size != rid.size:
-                    continue  # not hit-aligned with the rawids
-                # some cycles store a class as all-NaN floats: no information
-                known = np.isfinite(flat) if flat.dtype.kind == "f" else slice(None)
-                flat = flat[known].astype(np.int64)
-                if flat.size == 0:
-                    continue
-                unset = ((flat[:, None] >> np.arange(QC_MAX_BITS)) & 1) == 0
-                counts = np.stack(
-                    [
-                        np.bincount(inverse[known], unset[:, b], ids.size)
-                        for b in range(QC_MAX_BITS)
-                    ],
-                    axis=1,
-                ).astype(np.int64)
-                out["bits"][name] = dict(zip(ids.tolist(), counts, strict=True))
-                out["max"][name] = int(flat.max()) if flat.size else 0
             dd = raw.get(f"{nbb}/is_delayed_discharge")
             if dd is not None:
                 out["discharge"] = int((dd.nda.astype(bool) & keep).sum())
@@ -565,13 +612,13 @@ class ValidationData:
         )
         return built, len(runs)
 
-    def period_qc_flags(self, period, wait=True):
-        """:meth:`_qc_flag_counts` summed over every run of ``period``.
+    def run_qc_flags(self, period, wait=True):
+        """``([(run, counts)], (built, runs, errors))``: per-run QC flag counts.
 
-        Returns ``(counts, (built, runs, errors))``. With ``wait=False`` only
-        the runs built so far are summed; the rest are queued.
+        ``counts`` as :meth:`_qc_flag_counts`; runs without the fields are left
+        out. With ``wait=False`` only the runs built so far; the rest queued.
         """
-        total, built, errors = None, 0, []
+        per_run, built, errors = [], 0, []
         runs = sorted(self.viewer.available_runs().get(period, {}))
         for run in runs:
             part = self._qc_flag_counts(period, run, wait)
@@ -580,23 +627,32 @@ class ValidationData:
             built += 1
             if isinstance(part, dict) and "error" in part:
                 errors.append(f"{run}: {part['error']}")
-                continue
-            if part is None:
-                continue
+            elif part is not None:
+                per_run.append((run, part))
+        return per_run, (built, len(runs), errors)
+
+    def period_qc_flags(self, period, wait=True):
+        """:meth:`_qc_flag_counts` summed over every run of ``period``.
+
+        Returns ``(counts, (built, runs, errors))``, see :meth:`run_qc_flags`.
+        """
+        per_run, progress = self.run_qc_flags(period, wait)
+        total = None
+        for _run, part in per_run:
             if total is None:
-                total = {"events": 0, "failing": {}, "bits": {}, "max": {}}
+                total = {"events": 0, "failing": {}, "flags": [], "reasons": {}}
                 total["discharge"] = 0 if part["discharge"] is not None else None
             total["events"] += part["events"]
             for rid, n in part["failing"].items():
                 total["failing"][rid] = total["failing"].get(rid, 0) + n
-            for name, per in part["bits"].items():
-                acc = total["bits"].setdefault(name, {})
-                for rid, counts in per.items():
-                    acc[rid] = acc.get(rid, 0) + counts
-                total["max"][name] = max(total["max"].get(name, 0), part["max"][name])
+            total["flags"] += [f for f in part["flags"] if f not in total["flags"]]
+            for rid, per in part["reasons"].items():
+                acc = total["reasons"].setdefault(rid, {})
+                for flag, n in per.items():
+                    acc[flag] = acc.get(flag, 0) + n
             if part["discharge"] is not None and total["discharge"] is not None:
                 total["discharge"] += part["discharge"]
-        return total, (built, len(runs), errors)
+        return total, progress
 
     def _summary_key(self, period, run):
         files = tuple(str(f) for f in self.viewer._run_files(period, run))

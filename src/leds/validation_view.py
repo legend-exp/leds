@@ -23,7 +23,14 @@ from bokeh.models import (
     LogColorMapper,
     Span,
 )
-from bokeh.palettes import Category10, Category20, RdBu11, Turbo256, Viridis256
+from bokeh.palettes import (
+    Category10,
+    Category20,
+    OrRd9,
+    RdBu11,
+    Turbo256,
+    Viridis256,
+)
 from bokeh.plotting import figure
 
 from leds import calcheck
@@ -44,6 +51,7 @@ PLOTS = (
     "calibration detail",
     "qc survival by string",
     "qc failing flags",
+    "qc failures by run",
     "calibration check",
 )
 
@@ -245,8 +253,7 @@ def qc_failing_flags(rows, flags, table, counts, period):
     """Detectors x QC flags: how often each flag fails, per physics event.
 
     ``rows`` is ``[(label, rawid)]`` in string order; ``table`` maps rawid to
-    ``{flag: unset count}`` over QC-failing hits (see
-    :func:`leds.validation.qc_flag_table`).
+    ``{flag: failing hits it caused}`` (see :func:`leds.validation._qc_reasons`).
     """
     events = max(counts["events"], 1)
     columns = ["fails QC", *flags]
@@ -300,6 +307,99 @@ def qc_failing_flags(rows, flags, table, counts, period):
     fig.add_layout(ColorBar(color_mapper=mapper, title="fraction", width=10), "right")
     fig.xaxis.major_label_orientation = 0.9
     fig.axis.major_label_text_font_size = "9px"
+    fig.grid.grid_line_color = None
+    fig.axis.axis_line_color = None
+    return fig
+
+
+def _short_flag(flag):
+    return flag.removeprefix("is_valid_").removeprefix("is_") if flag else "(no flag)"
+
+
+def qc_failures_by_run(per_run, names, period, n=10):
+    """Runs x rank: each run's ``n`` detectors failing QC most, and why.
+
+    ``per_run`` is ``[(run, top)]`` with ``top`` from
+    :func:`leds.validation.top_failures`; ``names`` maps rawid to a label
+    (``"s04 V01240A"``). Each cell shows the detector, its leading flag and
+    the fraction of physics events it fails QC in, coloured by that fraction.
+    """
+    runs = [run for run, _ in per_run]
+    ranks = [f"#{k + 1}" for k in range(n)]
+    xs, ys, det, sub, frac, text_color, tip = [], [], [], [], [], [], []
+    fracs = [f for _, top in per_run for _, _, f, _, _ in top if f > 0]
+    lo, hi = (min(fracs), max(fracs)) if fracs else (1e-6, 1.0)
+    span = np.log(hi / lo) if hi > lo else 1.0
+    for run, top in per_run:
+        for k, (rid, failing, f, lead, share) in enumerate(top):
+            label = names.get(rid, f"ch{rid}")
+            string, _, name = label.partition(" ")
+            xs.append(ranks[k])
+            ys.append(run)
+            det.append(f"{name or label} ({string})" if name else label)
+            sub.append(f"{_short_flag(lead)} {f:.2%}")
+            frac.append(f)
+            dark = f > 0 and np.log(f / lo) / span > 0.55
+            text_color.append("#FFFFFF" if dark else "#1B2530")
+            share_t = f"{share:.0%} of its failing hits" if share == share else "--"
+            tip.append(f"{failing} failing hits; leading flag in {share_t}")
+    source = ColumnDataSource(
+        {
+            "x": xs,
+            "y": ys,
+            "det": det,
+            "sub": sub,
+            "frac": frac,
+            "color": text_color,
+            "tip": tip,
+        }
+    )
+    mapper = LogColorMapper(palette=list(reversed(OrRd9)), low=lo, high=hi)
+    fig = figure(
+        x_range=ranks,
+        y_range=list(reversed(runs)),
+        height=44 * len(runs) + 110,
+        sizing_mode="stretch_width",
+        tools="save",
+        toolbar_location="right",
+        x_axis_location="above",
+        title=f"detectors failing QC most, per run of {period}: leading flag and "
+        "fraction of physics events",
+    )
+    fig.rect(
+        "x",
+        "y",
+        1,
+        1,
+        source=source,
+        line_color="white",
+        fill_color={"field": "frac", "transform": mapper},
+    )
+    for field, offset, size in (("det", 7, "9px"), ("sub", -7, "8px")):
+        fig.text(
+            "x",
+            "y",
+            text=field,
+            source=source,
+            text_align="center",
+            text_baseline="middle",
+            y_offset=offset,
+            text_font_size=size,
+            text_color="color",
+        )
+    fig.add_tools(
+        HoverTool(
+            tooltips=[
+                ("run", "@y"),
+                ("rank", "@x"),
+                ("detector", "@det"),
+                ("fails QC in", "@frac{0.000%} of physics events"),
+                ("", "@tip"),
+            ]
+        )
+    )
+    fig.add_layout(ColorBar(color_mapper=mapper, title="fraction", width=10), "right")
+    fig.axis.major_label_text_font_size = "10px"
     fig.grid.grid_line_color = None
     fig.axis.axis_line_color = None
     return fig
