@@ -44,17 +44,18 @@ listens on port 5006 and runs under an arbitrary non-root UID, as Spin requires.
 
 ### Service environment
 
-| Variable                      | Required          | Meaning                                                                                                                                             |
-| ----------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LEDS_BASE_PATH`              | yes               | production cycle(s) on the mounted filesystem (e.g. CFS)                                                                                            |
-| `BOKEH_ALLOW_WS_ORIGIN`       | yes               | public hostname (`host[:port]`) allowed to open the websocket, i.e. the Spin ingress name                                                           |
-| `NUM_PROCS`                   | no (default 2)    | Panel worker processes; sessions in one process share its caches (and its HDF5 lock, see Threads)                                                   |
-| `NUM_THREADS`                 | no (default 4)    | thread pool per worker that callbacks run on, so one session's slow read does not freeze the others; `0` disables it (see Threads)                  |
-| `LEDS_PREWARM`                | no (default on)   | scan cycles and build the newest channelmap before forking workers, so the first session of each is warm; delays the listening socket; `0` disables |
-| `LEDS_CACHE_TTL`              | no (default 3600) | seconds a metadata-derived entry (channelmaps, statuses, calibration pars) is reused before being re-read                                           |
-| `LEDS_SCAN_TTL`               | no (default 300)  | seconds a directory scan is reused; bounds how long a newly-written run stays invisible                                                             |
-| `LEDS_MAX_CACHED_RUN_SPECTRA` | no (default 4)    | whole runs of per-hit energies held **per worker**; the dominant memory line                                                                        |
-| `LEDS_MAX_CACHED_CAL_PARS`    | no (default 4)    | parsed `par_hit`/`par_pht` calibration pars held **per worker**; MB-scale each                                                                      |
+| Variable                          | Required          | Meaning                                                                                                                                             |
+| --------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LEDS_BASE_PATH`                  | yes               | production cycle(s) on the mounted filesystem (e.g. CFS)                                                                                            |
+| `BOKEH_ALLOW_WS_ORIGIN`           | yes               | public hostname (`host[:port]`) allowed to open the websocket, i.e. the Spin ingress name                                                           |
+| `NUM_PROCS`                       | no (default 2)    | Panel worker processes; sessions in one process share its caches (and its HDF5 lock, see Threads)                                                   |
+| `NUM_THREADS`                     | no (default 4)    | thread pool per worker that callbacks run on, so one session's slow read does not freeze the others; `0` disables it (see Threads)                  |
+| `LEDS_PREWARM`                    | no (default on)   | scan cycles and build the newest channelmap before forking workers, so the first session of each is warm; delays the listening socket; `0` disables |
+| `LEDS_CACHE_TTL`                  | no (default 3600) | seconds a metadata-derived entry (channelmaps, statuses, calibration pars) is reused before being re-read                                           |
+| `LEDS_SCAN_TTL`                   | no (default 300)  | seconds a directory scan is reused; bounds how long a newly-written run stays invisible                                                             |
+| `LEDS_MAX_CACHED_RUN_SPECTRA`     | no (default 4)    | whole runs of per-hit energies held **per worker**; the dominant memory line                                                                        |
+| `LEDS_MAX_CACHED_CAL_PARS`        | no (default 32)   | calibration parts of `par_hit`/`par_pht` files held **per worker**; ~5 MB each                                                                      |
+| `LEDS_MAX_CACHED_VALIDATION_RUNS` | no (default 64)   | binned per-run rate summaries (all strings) held **per worker**; ~1.3 MB each                                                                       |
 
 Sessions in one worker share the read-only data they have in common —
 channelmaps, detector statuses, directory scans, per-run reductions — so a
