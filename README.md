@@ -62,7 +62,7 @@ listens on port 5006 and runs under an arbitrary non-root UID, as Spin requires.
 | `LEDS_CACHE_TTL`              | no (default 3600) | seconds a metadata-derived entry (channelmaps, statuses, calibration pars) is reused before being re-read                                           |
 | `LEDS_SCAN_TTL`               | no (default 300)  | seconds a directory scan is reused; bounds how long a newly-written run stays invisible                                                             |
 | `LEDS_MAX_CACHED_RUN_SPECTRA` | no (default 4)    | whole runs of per-hit energies held **per worker**; the dominant memory line                                                                        |
-| `LEDS_MAX_CACHED_CAL_PARS`    | no (default 4)    | parsed `par_hit` calibration files held **per worker**; MB-scale each                                                                               |
+| `LEDS_MAX_CACHED_CAL_PARS`    | no (default 4)    | parsed `par_hit`/`par_pht` calibration pars held **per worker**; MB-scale each                                                                      |
 
 Sessions in one worker share the read-only data they have in common —
 channelmaps, detector statuses, directory scans, per-run reductions — so a

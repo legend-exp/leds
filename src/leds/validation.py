@@ -6,14 +6,16 @@ day-aligned absolute axis) and dropped — only the tiny binned summaries are
 cached (~150 kB per run), so a whole period never holds per-hit arrays.
 Rebinning to the user-selected width is pure array arithmetic on the cache.
 
-Calibration curves come from the ``par_hit`` YAMLs (per *cal* run, matched to
-the viewed run via ``validity.yaml``), not from lh5 data: the fitted peak
-centroids (ADC) and the calibration expression are all that is needed.
+Calibration curves come from the ``par_hit`` / ``par_pht`` YAMLs, loaded
+through dbetto's ``TextDB`` at the viewed run's start key (so ``validity.yaml``
+decides which cal run applies), not from lh5 data: the fitted peak centroids
+(ADC) and the calibration expression are all that is needed.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import awkward as ak
@@ -21,7 +23,7 @@ import boost_histogram as bh
 import lh5
 import numexpr as ne
 import numpy as np
-from dbetto import Props
+from dbetto import TextDB
 from dbetto.catalog import Catalog
 from lh5.io.exceptions import LH5DecodeError
 
@@ -55,6 +57,18 @@ PEAKS_SUMMARY = (2614.511, 583.191, 2103.511)
 #: Calibration energy parameter whose curve is displayed (the production
 #: energy estimator).
 ENERGY_PARAM = "cuspEmax_ctc_cal"
+#: Uncalibrated (ADC) input the calibration chain starts from.
+RAW_ENERGY = ENERGY_PARAM.removesuffix("_cal")
+
+#: Calibration par tiers to look in, preferred first, per event tier:
+#: partitioned event data (``pet``) is calibrated by the partition-level
+#: ``par_pht``, per-run event data (``evt``) by ``par_hit``.
+CAL_PAR_TIERS = {"pet": ("pht", "hit"), "evt": ("hit", "pht")}
+
+#: ``validity.yaml`` categories tried in order. The viewed data is physics
+#: (``Catalog`` falls back from ``phy`` to ``all`` by itself), but a catalog
+#: may list its entries under ``cal`` only.
+CAL_PAR_CATEGORIES = ("phy", "cal")
 
 #: Cached per-channelmap string maps. A period usually spans a handful of
 #: channelmap timestamps, and deriving one costs a channelmap build.
@@ -378,47 +392,103 @@ class ValidationData:
 
     # -- calibration parameters ------------------------------------------------
 
-    def load_cal_pars(self, period, run):
-        """The ``par_hit`` calibration dict applying to ``(period, run)``.
+    def cal_par_sources(self, period, run):
+        """Where the calibration pars valid for ``(period, run)`` are.
 
-        Returns ``(pars, source_label)``, or ``(None, reason)`` when no par
-        file can be found. Resolution: the run's own cal par file if present,
-        else the ``validity.yaml`` entry valid at the run's start key.
+        Returns ``(sources, reason)``. ``sources`` lists ``(tier, root,
+        category, start_key, files)`` for each par tier with pars valid at the
+        run's start key, preferred tier first (see ``CAL_PAR_TIERS``); only
+        the ``validity.yaml`` catalogs are read here. ``reason`` says what was
+        searched, for when the list is empty.
         """
-        par_root = self.viewer.paths.get("par_hit")
-        if not par_root:
-            return None, "this cycle's dataflow config has no par_hit path"
-        par_root = Path(par_root)
+        start_key = self._start_key(period, run)
+        if not start_key:
+            return [], f"no start key for {period} {run}"
+        tiers = CAL_PAR_TIERS.get(getattr(self.viewer, "tier", "evt"), ("hit", "pht"))
+        sources, searched = [], []
+        for tier in tiers:
+            root = self.viewer.paths.get(f"par_{tier}")
+            if not root:
+                continue
+            root = Path(root)
+            validity = root / "validity.yaml"
+            if not validity.is_file():
+                searched.append(f"par_{tier}={root} (no validity.yaml)")
+                continue
+            files, category = self._valid_par_files(validity, start_key, tier)
+            if not files:
+                searched.append(f"par_{tier}={root} (no par_{tier} entry valid)")
+                continue
+            missing = [f for f in files if not (root / f).is_file()]
+            if missing:
+                searched.append(
+                    f"par_{tier}={root} (listed file missing: {missing[0]})"
+                )
+                continue
+            sources.append((tier, root, category, start_key, files))
+        if sources:
+            return sources, None
+        where = (
+            "; ".join(searched)
+            or "this cycle's dataflow config has no par_hit/par_pht path"
+        )
+        return [], (
+            f"no calibration pars valid at {start_key} for {period} {run} "
+            f"(searched {where})"
+        )
 
-        par_file = None
-        direct = sorted((par_root / "cal" / period / run).glob("*-par_hit.yaml"))
-        if direct:
-            par_file = direct[0]
-        else:
-            validity = par_root / "validity.yaml"
-            start_key = self._start_key(period, run)
-            if validity.is_file() and start_key:
-                try:
-                    entries = Catalog.read_from(str(validity)).valid_for(
-                        start_key, allow_none=True
-                    )
-                except ValueError:
-                    entries = None
-                for entry in entries or []:
-                    if str(entry).endswith("par_hit.yaml"):
-                        par_file = par_root / entry
-                        break
-        if par_file is None or not par_file.is_file():
-            return None, f"no par_hit calibration file found for {period} {run}"
+    @staticmethod
+    def _valid_par_files(validity, start_key, tier):
+        """``(files, category)`` of the ``par_<tier>`` YAMLs valid at ``start_key``."""
+        try:
+            catalog = Catalog.read_from(str(validity))
+        except (ValueError, KeyError, TypeError):
+            return [], None
+        for category in CAL_PAR_CATEGORIES:
+            try:
+                entries = catalog.valid_for(start_key, category, allow_none=True)
+            except ValueError:  # malformed start key
+                return [], None
+            files = [
+                str(f) for f in (entries or []) if str(f).endswith(f"par_{tier}.yaml")
+            ]
+            if files:
+                return files, category
+        return [], None
 
-        # shared across sessions: these files are MB-scale and take ~0.7 s to
-        # parse, and every session looking at this run wants the same one
-        pars = CAL_PARS.get((str(par_file),), lambda: Props.read_from(str(par_file)))
+    def load_cal_source(self, source):
+        """``(pars, label)`` for one entry of :meth:`cal_par_sources`.
 
-        # l200-p15-r005-cal-<ts>-par_hit.yaml -> "cal pars: p15 r005"
-        parts = par_file.name.split("-")
-        label = f"cal pars: {parts[1]} {parts[2]}" if len(parts) > 2 else par_file.name
-        return pars, label
+        Loaded through dbetto's ``TextDB``, which merges the listed files the
+        way the dataflow does. Shared across sessions: these files are
+        MB-scale and take ~0.7 s to parse, and every session looking at this
+        run wants the same ones.
+        """
+        tier, root, category, start_key, files = source
+
+        def load():
+            return TextDB(root, lazy=True).on(
+                start_key, pattern=rf".*par_{tier}\.yaml$", category=category
+            )
+
+        # keyed by the resolved files, not the start key: every run the same
+        # validity entry covers shares one parse
+        pars = CAL_PARS.get((str(root), tuple(files)), load)
+        # .../l200-p15-r005-cal-<ts>-par_hit.yaml -> "cal pars (hit): p15 r005"
+        parts = Path(files[-1]).name.split("-")
+        run = f"{parts[1]} {parts[2]}" if len(parts) > 2 else Path(files[-1]).name
+        return pars, f"cal pars ({tier}): {run}"
+
+    def load_cal_pars(self, period, run):
+        """The calibration pars dict applying to ``(period, run)``.
+
+        Returns ``(pars, source_label)`` from the preferred par tier, or
+        ``(None, reason)`` when no tier has pars valid at the run's start key.
+        """
+        sources, reason = self.cal_par_sources(period, run)
+        if not sources:
+            return None, reason
+        return self.load_cal_source(sources[0])
 
     def _start_key(self, period, run):
         runinfo = self.viewer.status_db.runinfo
@@ -429,16 +499,36 @@ class ValidationData:
         return tstamps[0] if tstamps else None
 
 
-# -- calibration curve math (pure functions over a parsed par_hit dict) --------
+# -- calibration curve math (pure functions over a parsed par_hit/pht dict) ----
 
 
-def _eval_cal(operation, x):
-    """Apply a par_hit calibration ``operation`` to ADC value(s) ``x``."""
-    var = ENERGY_PARAM.removesuffix("_cal")
-    out = ne.evaluate(
-        operation["expression"],
-        local_dict={var: np.asarray(x, dtype=float), **operation["parameters"]},
-    )
+def _cal_chain(operations):
+    """Steps ``(input, name, operation)`` from ``RAW_ENERGY`` to ``ENERGY_PARAM``.
+
+    ``par_hit`` has one step. ``par_pht`` has two: a per-run
+    ``cuspEmax_ctc_runcal`` of the ADC value, then the partition-level
+    ``cuspEmax_ctc_cal`` of that. Raises ``KeyError`` for anything else.
+    """
+    chain, name = [], ENERGY_PARAM
+    while len(chain) <= len(operations):
+        op = operations[name]
+        names = set(re.findall(r"[A-Za-z_]\w*", op["expression"]))
+        inputs = [v for v in names if v == RAW_ENERGY or v in operations]
+        if len(inputs) != 1 or inputs[0] == name:
+            break
+        chain.insert(0, (inputs[0], name, op))
+        if inputs[0] == RAW_ENERGY:
+            return chain
+        name = inputs[0]
+    msg = f"no single-input calibration chain from {RAW_ENERGY} to {ENERGY_PARAM}"
+    raise KeyError(msg)
+
+
+def _eval_cal(chain, x):
+    """Apply a calibration ``chain`` (see :func:`_cal_chain`) to ADC value(s) ``x``."""
+    out = np.asarray(x, dtype=float)
+    for var, _name, op in chain:
+        out = ne.evaluate(op["expression"], local_dict={var: out, **op["parameters"]})
     return np.asarray(out, dtype=float)
 
 
@@ -452,8 +542,9 @@ def cal_curve(pars, detector):
     Raises ``KeyError`` if the detector has no usable ecal results.
     """
     det = pars[detector]
-    operation = det["pars"]["operations"][ENERGY_PARAM]
-    pk_fits = det["results"]["ecal"][ENERGY_PARAM]["pk_fits"]
+    chain = _cal_chain(det["pars"]["operations"])
+    # the ADC peak fits are stored under the step that takes the ADC value
+    pk_fits = det["results"]["ecal"][chain[0][1]]["pk_fits"]
 
     peaks, mus, mu_errs = [], [], []
     for peak_key, fit in sorted(pk_fits.items(), key=lambda kv: float(kv[0])):
@@ -471,8 +562,8 @@ def cal_curve(pars, detector):
     peaks_arr = np.array(peaks)
     mus_arr = np.array(mus)
     mu_errs_arr = np.array(mu_errs)
-    cal_mu = _eval_cal(operation, mus_arr)
-    cal_err = np.abs(_eval_cal(operation, mus_arr + mu_errs_arr) - cal_mu)
+    cal_mu = _eval_cal(chain, mus_arr)
+    cal_err = np.abs(_eval_cal(chain, mus_arr + mu_errs_arr) - cal_mu)
     line_x = np.linspace(0.0, 1.1 * mus_arr.max(), 200)
     return {
         "peaks": peaks_arr,
@@ -482,8 +573,12 @@ def cal_curve(pars, detector):
         "cal_err": cal_err,
         "residual": cal_mu - peaks_arr,
         "line_x": line_x,
-        "line_y": _eval_cal(operation, line_x),
-        "expression": operation["expression"],
+        "line_y": _eval_cal(chain, line_x),
+        "expression": (
+            chain[0][2]["expression"]
+            if len(chain) == 1
+            else "; ".join(f"{name} = {op['expression']}" for _, name, op in chain)
+        ),
     }
 
 
@@ -506,8 +601,8 @@ def cal_residuals(pars, ordered_names):
     for name in names:
         try:
             curve = cal_curve(pars, name)
-        except (KeyError, TypeError):
-            continue
+        except (KeyError, TypeError, AttributeError, ValueError):
+            continue  # no usable ecal results for this detector
         kept.append(name)
         i = len(kept) - 1
         for peak in PEAKS_SUMMARY:

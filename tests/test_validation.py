@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import awkward as ak
 import numpy as np
 import pytest
+import yaml
 
 from leds import validation_view
 from leds.validation import (
@@ -299,6 +300,24 @@ def test_cal_curve_linear():
     np.testing.assert_allclose(curve["line_y"], 0.5 * curve["line_x"], atol=1e-9)
 
 
+def test_cal_curve_pht_two_step_chain():
+    """par_pht: fits under the per-run step, the partition step applied on top."""
+    det = synthetic_pars()["V01"]
+    ops = det["pars"]["operations"]
+    ops["cuspEmax_ctc_runcal"] = ops.pop("cuspEmax_ctc_cal")
+    ops["cuspEmax_ctc_cal"] = {
+        "expression": "a + b * cuspEmax_ctc_runcal",
+        "parameters": {"a": 1.0, "b": 1.0},  # partition cal shifts by 1 keV
+    }
+    ecal = det["results"]["ecal"]
+    ecal["cuspEmax_ctc_runcal"] = ecal.pop("cuspEmax_ctc_cal")
+
+    curve = cal_curve({"V01": det}, "V01")
+
+    np.testing.assert_allclose(curve["residual"], 1.0, atol=1e-9)
+    assert "cuspEmax_ctc_runcal = a + b * cuspEmax_ctc" in curve["expression"]
+
+
 def test_cal_curve_no_valid_peaks():
     pars = synthetic_pars()
     for fit in pars["V01"]["results"]["ecal"]["cuspEmax_ctc_cal"]["pk_fits"].values():
@@ -317,49 +336,118 @@ def test_cal_residuals_order_and_nan():
     assert np.isnan(res583).all()  # only invalid fits for that peak
 
 
-def test_load_cal_pars_direct_validity_and_missing(tmp_path):
-    par_root = tmp_path / "par_hit"
-    direct = par_root / "cal" / "p01" / "r001"
-    direct.mkdir(parents=True)
-    (direct / "l200-p01-r001-cal-20250101T000000Z-par_hit.yaml").write_text(
-        "V01:\n  pars: {}\n"
-    )
-    runinfo = {"p02": {"r002": {"phy": {"start_key": "20250601T000000Z"}}}}
+def write_par_tier(root, tier, files, *, category=None, pars=None):
+    """A fake ``par_<tier>`` tree: ``files`` = {(period, run, tstamp): pars}."""
+    lines = []
+    for (period, run, tstamp), det_pars in files.items():
+        rel = f"cal/{period}/{run}/l200-{period}-{run}-cal-{tstamp}-par_{tier}.yaml"
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(yaml.safe_dump(det_pars or pars))
+        lines += [f"- valid_from: {tstamp}", "  mode: reset"]
+        if category:
+            lines.append(f"  category: {category}")
+        lines += ["  apply:", f"  - {rel}"]
+    (root / "validity.yaml").write_text("\n".join(lines) + "\n")
+
+
+def cal_viewer(paths, tier="evt", start_key="20250601T000000Z"):
     viewer = FakeViewer(
-        runs={"p01": {"r001": ["x"]}, "p02": {"r002": ["x"]}},
-        paths={"par_hit": str(par_root)},
-        runinfo=runinfo,
+        runs={"p02": {"r002": ["x"]}},
+        paths={k: str(v) for k, v in paths.items()},
+        runinfo={"p02": {"r002": {"phy": {"start_key": start_key}}}},
     )
-    data = ValidationData(viewer)
+    viewer.tier = tier
+    return viewer
 
-    # 1. the run's own par file wins
-    pars, label = data.load_cal_pars("p01", "r001")
+
+def test_load_cal_pars_through_validity(tmp_path):
+    hit = tmp_path / "hit"
+    write_par_tier(
+        hit,
+        "hit",
+        {
+            ("p01", "r001", "20250101T000000Z"): synthetic_pars(0.5),
+            ("p02", "r001", "20250701T000000Z"): synthetic_pars(0.7),
+        },
+    )
+    pars, label = ValidationData(cal_viewer({"par_hit": hit})).load_cal_pars(
+        "p02", "r002"
+    )
+    # the entry valid at the run's start key, not the newest file on disk
+    assert label == "cal pars (hit): p01 r001"
+    assert pars["V01"]["pars"]["operations"]["cuspEmax_ctc_cal"]["parameters"][
+        "b"
+    ] == pytest.approx(0.5)
+
+
+def test_load_cal_pars_cal_only_catalog(tmp_path):
+    # a catalog listing its entries under ``category: cal`` only: querying the
+    # default ``all`` finds nothing, which used to fail every run
+    hit = tmp_path / "hit"
+    write_par_tier(
+        hit,
+        "hit",
+        {("p01", "r001", "20250101T000000Z"): None},
+        category="cal",
+        pars=synthetic_pars(),
+    )
+    pars, label = ValidationData(cal_viewer({"par_hit": hit})).load_cal_pars(
+        "p02", "r002"
+    )
     assert pars is not None
-    assert "V01" in pars
-    assert label == "cal pars: p01 r001"
+    assert label == "cal pars (hit): p01 r001"
 
-    # 2. no direct file -> resolved through validity.yaml at the start key
-    (par_root / "validity.yaml").write_text(
-        "- valid_from: 20250101T000000Z\n"
-        "  apply:\n"
-        "  - cal/p01/r001/l200-p01-r001-cal-20250101T000000Z-par_hit.yaml\n"
+
+@pytest.mark.parametrize(("tier", "first"), [("pet", "pht"), ("evt", "hit")])
+def test_cal_par_tier_preference(tmp_path, tier, first):
+    paths = {}
+    for t in ("hit", "pht"):
+        paths[f"par_{t}"] = tmp_path / t
+        write_par_tier(
+            tmp_path / t, t, {("p01", "r001", "20250101T000000Z"): synthetic_pars()}
+        )
+    sources, _ = ValidationData(cal_viewer(paths, tier=tier)).cal_par_sources(
+        "p02", "r002"
     )
-    pars, label = data.load_cal_pars("p02", "r002")
+    assert [s[0] for s in sources] == [first, "pht" if first == "hit" else "hit"]
+
+
+def test_pht_only_cycle(tmp_path):
+    pht = tmp_path / "pht"
+    write_par_tier(pht, "pht", {("p01", "r001", "20250101T000000Z"): synthetic_pars()})
+    viewer = cal_viewer({"par_hit": tmp_path / "nohit", "par_pht": pht})
+    pars, label = ValidationData(viewer).load_cal_pars("p02", "r002")
     assert pars is not None
-    assert label == "cal pars: p01 r001"
+    assert label == "cal pars (pht): p01 r001"
 
-    # 3. nothing resolvable -> (None, reason)
-    viewer2 = FakeViewer(
-        runs={"p03": {"r001": ["x"]}}, paths={"par_hit": str(tmp_path / "nowhere")}
+
+def test_load_cal_pars_nothing_found_says_where(tmp_path):
+    pht = tmp_path / "pht"
+    pht.mkdir()
+    # listed in validity.yaml but never written (as in mock_prod's par/pht)
+    (pht / "validity.yaml").write_text(
+        "- valid_from: 20250101T000000Z\n  apply:\n"
+        "  - cal/p01/r001/l200-p01-r001-cal-20250101T000000Z-par_pht.yaml\n"
     )
-    pars, reason = ValidationData(viewer2).load_cal_pars("p03", "r001")
+    viewer = cal_viewer({"par_hit": tmp_path / "nowhere", "par_pht": pht})
+    pars, reason = ValidationData(viewer).load_cal_pars("p02", "r002")
     assert pars is None
-    assert "no par_hit" in reason
+    assert "20250601T000000Z" in reason
+    assert f"par_hit={tmp_path / 'nowhere'} (no validity.yaml)" in reason
+    assert "listed file missing" in reason
 
-    # 4. cycle without a par_hit path at all
-    pars, reason = ValidationData(FakeViewer()).load_cal_pars("p01", "r001")
+    # before the first validity entry
+    hit = tmp_path / "hit"
+    write_par_tier(hit, "hit", {("p01", "r001", "20250101T000000Z"): synthetic_pars()})
+    viewer = cal_viewer({"par_hit": hit}, start_key="20240101T000000Z")
+    pars, reason = ValidationData(viewer).load_cal_pars("p02", "r002")
     assert pars is None
-    assert "par_hit" in reason
+    assert "no par_hit entry valid" in reason
+
+    # cycle without any par path at all
+    pars, reason = ValidationData(cal_viewer({})).load_cal_pars("p02", "r002")
+    assert pars is None
+    assert "no par_hit/par_pht path" in reason
 
 
 def test_view_builders_smoke():

@@ -155,6 +155,41 @@ def test_returning_to_a_tab_does_not_touch_the_pane_object(display, tab, pane):
     assert events == []
 
 
+@pytest.mark.parametrize(
+    ("tab", "pane", "control", "values"),
+    [
+        (
+            app_mod.TAB_DATASET,
+            "dataset_pane",
+            "dataset_plot",
+            app_mod.dataset_view.PLOTS[:2],
+        ),
+        (
+            app_mod.TAB_VALIDATION,
+            "validation_pane",
+            "validation_plot",
+            app_mod.validation_view.PLOTS[:2],
+        ),
+    ],
+)
+def test_revisiting_a_plot_shows_a_fresh_figure(display, tab, pane, control, values):
+    """Re-showing a figure Panel already rendered raises (stylesheets TypeError).
+
+    That used to happen on going back to any plot seen earlier in the session
+    (figures were cached), silently leaving the previous plot on screen.
+    """
+    display.tabs.active = tab
+    shown = []
+    getattr(display, pane).param.watch(lambda e: shown.append(e.new), "object")
+
+    first, second = values
+    for value in (second, first, second):
+        setattr(display, control, value)
+
+    assert len(shown) == 3
+    assert len({id(fig) for fig in shown}) == 3, "a figure was re-shown"
+
+
 def test_a_failing_updater_does_not_abort_the_others(display, monkeypatch):
     """One tab's bug must surface as a message, not leave another tab half-switched."""
     calls = []
@@ -174,6 +209,25 @@ def test_a_failing_updater_does_not_abort_the_others(display, monkeypatch):
     assert display.message.visible
     assert "RuntimeError" in display.message.object
     assert "dataset" in display.message.object
+
+
+def test_an_undrawable_validation_plot_replaces_the_previous_one(display, monkeypatch):
+    """No calibration pars must say why in the tab, not leave the last plot up."""
+    display.tabs.active = app_mod.TAB_VALIDATION
+    assert display.validation_area.objects == [display.validation_pane]
+    monkeypatch.setattr(
+        display.validation_data,
+        "cal_par_sources",
+        lambda _p, _r: ([], "no calibration pars valid (searched par_hit=/x)"),
+    )
+
+    display.validation_plot = "calibration summary"
+
+    assert display.validation_area.objects == [display.validation_note]
+    assert r"searched par\_hit=/x" in display.validation_note.object
+
+    display.validation_plot = next(iter(app_mod.validation_view.RATE_BUILDERS))
+    assert display.validation_area.objects == [display.validation_pane]
 
 
 def test_a_build_finished_after_leaving_the_tab_is_ready_on_return(
