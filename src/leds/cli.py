@@ -48,9 +48,10 @@ def _prewarm(base_path):
         try:
             viewer = EventViewer(path)
             runs = viewer.available_runs()
-            # the newest run's channelmap is what a new session renders first
-            for period in sorted(runs)[-1:]:
-                for run in sorted(runs[period])[-1:]:
+            # what a new session or a cycle switch opens: the first run of
+            # the oldest period (EventDisplay._apply_period)
+            for period in sorted(runs)[:1]:
+                for run in sorted(runs[period])[:1]:
                     for tstamp in runs[period][run][:1]:
                         viewer._channelmap(tstamp)
                         viewer.statuses(tstamp)
