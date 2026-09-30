@@ -85,6 +85,12 @@ second user on the same cycle starts nearly instantly and does not duplicate
 that memory. All the bounds above are **per worker process**, so multiply by
 `NUM_PROCS` when sizing the Spin memory limit.
 
+The Validation tab's calibration check also keeps up to 32 cal runs of
+per-detector spectra per worker (~110 MB). It builds them in the background from
+a few files of each cal run: about 1 s a run from the evt tier, and 15–30 s a
+run from the hit tier for the `is_valid_cal` section tick boxes, so a period's
+section data takes several minutes the first time each worker shows it.
+
 Because that sharing includes the parsed metadata, an updated metadata checkout
 is picked up within `LEDS_CACHE_TTL` rather than immediately. Lower it if the
 deployment updates metadata often; restarting the service always picks it up at

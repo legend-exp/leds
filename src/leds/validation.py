@@ -15,6 +15,7 @@ expression are all that is needed, so only those parts are parsed.
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 from pathlib import Path
@@ -77,6 +78,32 @@ EVT_FIELDS = {
     "geds": ("multiplicity", "rawid", "energy"),
 }
 EVT_NESTED = ("geds/quality/is_bb_like", "geds/psd/is_bb_like")
+
+#: Read only for the failing-flags plot, in their own pass, so the rate
+#: summaries do not pay for them: the physics-event flags, and per
+#: QC-failing hit its rawid and one bitmask per waveform class.
+QC_FLAG_FIELDS = {
+    "trigger": ("is_forced",),
+    "coincident": ("puls",),
+    "geds/quality/is_not_bb_like": (
+        "rawid",
+        "is_empty_bits",
+        "is_pos_polarity_bits",
+        "is_highly_pos_polarity_bits",
+        "is_neg_polarity_bits",
+        "is_delayed_discharge",
+    ),
+}
+
+#: evt bitmask field -> the hit-tier candidate whose ``aggregations`` table
+#: names its bits (bit set = that flag passed).
+QC_CLASSES = {
+    "is_empty_bits": "is_empty_candidate",
+    "is_neg_polarity_bits": "is_negative_polarity_candidate",
+    "is_pos_polarity_bits": "is_positive_polarity_candidate",
+    "is_highly_pos_polarity_bits": "is_highly_positive_polarity_candidate",
+}
+QC_MAX_BITS = 16  # bits counted per class; the tables use at most 10
 
 #: Calibration par tiers to look in, preferred first, per event tier:
 #: partitioned event data (``pet``) is calibrated by the partition-level
@@ -154,6 +181,26 @@ def _read_fields(group, handles, fields, prefix=""):
     return out
 
 
+def _read_groups(group, files, spec, nested=()):
+    """``{"<sub>/<field>": lgdo or None}`` for every group in ``spec``.
+
+    Each file is opened once for all of them, not once per field.
+    """
+    handles = []
+    try:
+        for f in files:
+            handles.append(h5py.File(f, "r", locking=False))
+        raw = {}
+        for sub, fields in spec.items():
+            raw |= _read_fields(f"{group}/{sub}", handles, fields, prefix=sub)
+        for path in nested:
+            raw |= _read_fields(group, handles, (path,))
+        return raw
+    finally:
+        for h in handles:
+            h.close()
+
+
 def survival_fraction(pass_rate, fail_rate):
     """Per-bin fraction ``pass / (pass + fail)``, NaN where nothing was seen.
 
@@ -165,6 +212,49 @@ def survival_fraction(pass_rate, fail_rate):
     total = pass_rate + fail_rate
     with np.errstate(invalid="ignore", divide="ignore"):
         return np.where(total > 0, pass_rate / total, np.nan)
+
+
+@functools.lru_cache(maxsize=16)
+def qc_bit_tables(config_root):
+    """``{evt bitmask field: [flag name per bit]}`` from a cycle's hit config.
+
+    Read from the ``aggregations`` of the first ``tier/hit/*-hit_config.yaml``
+    under ``config_root`` that defines all four QC candidates; ``{}`` if none.
+    """
+    for path in sorted(Path(config_root, "tier", "hit").glob("*-hit_config.yaml")):
+        try:
+            agg = yaml.load(path.read_text(), Loader=_YAML_LOADER).get("aggregations")
+            tables = {
+                evt: [agg[cand][f"bit{i}"] for i in range(len(agg[cand]))]
+                for evt, cand in QC_CLASSES.items()
+            }
+        except (AttributeError, KeyError, TypeError, yaml.YAMLError, OSError):
+            continue
+        return tables
+    return {}
+
+
+def qc_flag_table(counts, tables):
+    """Name the unset-bit counts of :meth:`ValidationData.period_qc_flags`.
+
+    Returns ``(flags, {rawid: {flag: count}})``. A flag in several classes is
+    the same stored boolean in each, so its first class is used. A class
+    whose table is missing, or narrower than its stored bitmasks, is labelled
+    ``"<class> bit N"`` instead.
+    """
+    flags, values = [], {}
+    for name, per_rawid in counts["bits"].items():
+        width = max(counts["max"].get(name, 0).bit_length(), 1)
+        table = tables.get(name)
+        if not table or len(table) < width:
+            table = [f"{name.removesuffix('_bits')} bit {b}" for b in range(width)]
+        for bit, flag in enumerate(table):
+            if flag in flags:
+                continue
+            flags.append(flag)
+            for rid, unset in per_rawid.items():
+                values.setdefault(rid, {})[flag] = int(unset[bit])
+    return flags, values
 
 
 class ValidationData:
@@ -186,18 +276,7 @@ class ValidationData:
         files = self.viewer._run_files(period, run)
         if not files:
             return {"timestamp": np.empty(0)}  # _summary skips an empty run
-        handles = []
-        try:
-            for f in files:
-                handles.append(h5py.File(f, "r", locking=False))
-            raw = {}
-            for sub, fields in EVT_FIELDS.items():
-                raw |= _read_fields(f"{group}/{sub}", handles, fields, prefix=sub)
-            for path in EVT_NESTED:
-                raw |= _read_fields(group, handles, (path,))
-        finally:
-            for h in handles:
-                h.close()
+        raw = _read_groups(group, files, EVT_FIELDS, EVT_NESTED)
         if raw["trigger/timestamp"] is None:
             msg = f"no {group}/trigger/timestamp in {period} {run}"
             raise KeyError(msg)
@@ -378,6 +457,91 @@ class ValidationData:
                 continue
         return []
 
+    def _qc_flag_counts(self, period, run):
+        """Per detector, how often each QC bit is unset, over physics events.
+
+        Returns ``{"events": physics events, "failing": {rawid: failing hits},
+        "bits": {class: {rawid: (QC_MAX_BITS,) unset counts}}, "max": {class:
+        largest stored bitmask}, "discharge": delayed-discharge events}``, or
+        ``None`` without the ``is_not_bb_like`` fields. Only QC-failing hits
+        carry bitmasks. A pass of its own over the files, cached like
+        :meth:`_summary`, so the rate plots never read these fields.
+        """
+        files = self.viewer._run_files(period, run)
+
+        def build():
+            raw = _read_groups(self.viewer.group, files, QC_FLAG_FIELDS)
+            nbb = "geds/quality/is_not_bb_like"
+            if raw.get(f"{nbb}/rawid") is None:
+                return None
+            rawid = raw[f"{nbb}/rawid"].view_as("ak")
+            forced, puls = raw.get("trigger/is_forced"), raw.get("coincident/puls")
+            keep = np.ones(len(rawid), dtype=bool)
+            if forced is not None and puls is not None:
+                keep = ~(forced.nda.astype(bool) | puls.nda.astype(bool))
+            rid = ak.to_numpy(ak.flatten(rawid[keep])).astype(np.int64)
+            ids, inverse, n_fail = np.unique(
+                rid, return_inverse=True, return_counts=True
+            )
+            out = {
+                "events": int(keep.sum()),
+                "failing": dict(zip(ids.tolist(), n_fail.tolist(), strict=True)),
+                "bits": {},
+                "max": {},
+                "discharge": None,
+            }
+            for name in QC_CLASSES:
+                arr = raw.get(f"{nbb}/{name}")
+                if arr is None:
+                    continue
+                flat = ak.to_numpy(ak.flatten(arr.view_as("ak")[keep]))
+                if flat.size != rid.size:
+                    continue  # not hit-aligned with the rawids
+                # some cycles store a class as all-NaN floats: no information
+                known = np.isfinite(flat) if flat.dtype.kind == "f" else slice(None)
+                flat = flat[known].astype(np.int64)
+                if flat.size == 0:
+                    continue
+                unset = ((flat[:, None] >> np.arange(QC_MAX_BITS)) & 1) == 0
+                counts = np.stack(
+                    [
+                        np.bincount(inverse[known], unset[:, b], ids.size)
+                        for b in range(QC_MAX_BITS)
+                    ],
+                    axis=1,
+                ).astype(np.int64)
+                out["bits"][name] = dict(zip(ids.tolist(), counts, strict=True))
+                out["max"][name] = int(flat.max()) if flat.size else 0
+            dd = raw.get(f"{nbb}/is_delayed_discharge")
+            if dd is not None:
+                out["discharge"] = int((dd.nda.astype(bool) & keep).sum())
+            return out
+
+        key = ("qc_flags", self.viewer.cycle_key, period, run, tuple(map(str, files)))
+        return VALIDATION_SUMMARIES.get(key, build)
+
+    def period_qc_flags(self, period):
+        """:meth:`_qc_flag_counts` summed over every run of ``period``."""
+        total = None
+        for run in sorted(self.viewer.available_runs().get(period, {})):
+            part = self._qc_flag_counts(period, run)
+            if part is None:
+                continue
+            if total is None:
+                total = {"events": 0, "failing": {}, "bits": {}, "max": {}}
+                total["discharge"] = 0 if part["discharge"] is not None else None
+            total["events"] += part["events"]
+            for rid, n in part["failing"].items():
+                total["failing"][rid] = total["failing"].get(rid, 0) + n
+            for name, per in part["bits"].items():
+                acc = total["bits"].setdefault(name, {})
+                for rid, counts in per.items():
+                    acc[rid] = acc.get(rid, 0) + counts
+                total["max"][name] = max(total["max"].get(name, 0), part["max"][name])
+            if part["discharge"] is not None and total["discharge"] is not None:
+                total["discharge"] += part["discharge"]
+        return total
+
     def _summary(self, period, run):
         """Binned counts of one run at base resolution, for every scope.
 
@@ -447,7 +611,7 @@ class ValidationData:
 
     # -- period assembly ------------------------------------------------------
 
-    def period_series(self, period, bin_seconds, string=None):
+    def period_series(self, period, bin_seconds, string=None, keys=None):
         """Mass-normalised rates of every series over all runs of ``period``.
 
         Returns ``(times_ms, rates)`` where ``times_ms`` are bin centres in
@@ -457,7 +621,8 @@ class ValidationData:
         break across gaps. ``string`` restricts events to hits in that string;
         rates are divided by the scope's ged mass (per run, from its
         channelmap). Rebinned from the cached base-resolution summaries; no
-        file is re-read when ``bin_seconds`` changes.
+        file is re-read when ``bin_seconds`` changes. ``keys`` limits the
+        result to those series.
         """
         if bin_seconds < BASE_BIN_SECONDS or bin_seconds % BASE_BIN_SECONDS:
             msg = (
@@ -467,6 +632,8 @@ class ValidationData:
             raise ValueError(msg)
         factor = bin_seconds // BASE_BIN_SECONDS
         all_keys = [(g, lbl) for g, labels in RATE_GROUPS.items() for lbl in labels]
+        if keys is not None:
+            all_keys = [k for k in all_keys if k in keys]
         times: list[np.ndarray] = []
         chunks: dict = {k: [] for k in all_keys}
 
@@ -505,6 +672,34 @@ class ValidationData:
             for k, parts in chunks.items()
         }
         return np.concatenate(times), rates
+
+    def ged_rows(self, period):
+        """``[(label, rawid)]`` of the geds, in string order, for heatmap rows."""
+        for run in sorted(self.viewer.available_runs().get(period, {})):
+            tstamps = self.viewer._run_tstamps(period, run)
+            if not tstamps:
+                continue
+            geds = self.viewer._channelmap(tstamps[0]).map("system", unique=False).geds
+            dets = sorted(
+                geds.map("name").values(),
+                key=lambda d: (int(d.location.string), int(d.location.position)),
+            )
+            return [
+                (f"s{int(d.location.string):02d} {d.name}", int(d.daq.rawid))
+                for d in dets
+            ]
+        return []
+
+    def qc_survival_by_string(self, period, bin_seconds):
+        """``(times_ms, {string: survival fraction})`` over ``period``."""
+        keys = [("qc", "pass"), ("qc", "fail")]
+        times, fracs = np.array([]), {}
+        for string in self.available_strings(period):
+            times, rates = self.period_series(period, bin_seconds, string, keys)
+            frac = survival_fraction(*(rates[k] for k in keys))
+            if frac is not None:
+                fracs[string] = frac
+        return times, fracs
 
     # -- calibration parameters ------------------------------------------------
 
@@ -581,16 +776,7 @@ class ValidationData:
         looking at this run wants the same ones.
         """
         tier, root, _category, _start_key, files = source
-
-        def load():
-            pars = AttrsDict()
-            for f in files:
-                pars = Props.add_to(pars, _read_cal_yaml(root / f))
-            return pars
-
-        # keyed by the resolved files, not the start key: every run the same
-        # validity entry covers shares one parse
-        pars = CAL_PARS.get((str(root), tuple(files)), load)
+        pars = load_par_files(root, files)
         # .../l200-p15-r005-cal-<ts>-par_hit.yaml -> "cal pars (hit): p15 r005"
         parts = Path(files[-1]).name.split("-")
         run = f"{parts[1]} {parts[2]}" if len(parts) > 2 else Path(files[-1]).name
@@ -669,6 +855,24 @@ def _read_cal_yaml(path):
     except yaml.YAMLError:
         pass
     return Props.read_from(str(path))
+
+
+def load_par_files(root, files):
+    """The calibration part of par ``files`` (relative to ``root``), merged.
+
+    Merged in order with dbetto's ``Props.add_to``, as ``TextDB.on`` does.
+    Cached by the resolved files, so every run one validity entry covers
+    shares one parse.
+    """
+    root = Path(root)
+
+    def load():
+        pars = AttrsDict()
+        for f in files:
+            pars = Props.add_to(pars, _read_cal_yaml(root / f))
+        return pars
+
+    return CAL_PARS.get((str(root), tuple(files)), load)
 
 
 # -- calibration curve math (pure functions over a parsed par_hit/pht dict) ----

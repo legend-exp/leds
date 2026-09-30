@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import yaml
 
+from leds import validation as validation_mod
 from leds import validation_view
 from leds.validation import (
     BIN_WIDTHS,
@@ -16,6 +17,7 @@ from leds.validation import (
     _read_cal_yaml,
     cal_curve,
     cal_residuals,
+    qc_flag_table,
     survival_fraction,
 )
 
@@ -215,6 +217,71 @@ def test_string_scoping_and_mass_normalisation():
     _, rall = data.period_series("p01", 3600)
     ratio = r1[("trigger", "all triggers")] / rall[("trigger", "all triggers")]
     np.testing.assert_allclose(ratio[~np.isnan(ratio)], 1.5)
+
+
+def test_qc_survival_by_string():
+    t = T0 + np.array([0.0, 600.0, 1200.0, 1800.0])
+    cols = columns(
+        t,
+        rawid=ak.Array([[101], [201], [101, 201], [201]]),
+        qc=np.array([True, False, True, True]),
+    )
+    data = ValidationData(FakeViewer(runs={"p01": {"r001": ["ts"]}}))
+    data._columns = lambda _period, _run: cols  # type: ignore[method-assign]
+    data._string_map = lambda _period, _run: (  # type: ignore[method-assign]
+        {1: frozenset({101}), 2: frozenset({201})},
+        {1: 2.0, 2: 4.0},
+    )
+
+    times, fracs = data.qc_survival_by_string("p01", 3600)
+
+    assert set(fracs) == {1, 2}
+    np.testing.assert_allclose(fracs[1][~np.isnan(fracs[1])], 1.0)  # e0, e2 pass
+    np.testing.assert_allclose(fracs[2][~np.isnan(fracs[2])], 2 / 3)  # e1 fails
+    assert times.size == fracs[1].size
+
+
+class FakeLGDO:
+    """Just enough of an lgdo for the QC flag reduction."""
+
+    def __init__(self, value):
+        self.value = value
+        self.nda = None if isinstance(value, ak.Array) else np.asarray(value)
+
+    def view_as(self, _kind):
+        return self.value
+
+
+def test_qc_flag_counts_and_names(monkeypatch):
+    nbb = "geds/quality/is_not_bb_like"
+    raw = {
+        "trigger/is_forced": FakeLGDO([False, False, True]),
+        "coincident/puls": FakeLGDO([False, False, False]),
+        f"{nbb}/rawid": FakeLGDO(ak.Array([[101, 201], [101], [101]])),
+        # bit 0 = flag_a, bit 1 = flag_b; set = passed
+        f"{nbb}/is_empty_bits": FakeLGDO(ak.Array([[0b10, 0b00], [0b01], [0b00]])),
+        f"{nbb}/is_delayed_discharge": FakeLGDO([True, False, True]),
+        # stored as all-NaN floats in some cycles: carries no information
+        f"{nbb}/is_pos_polarity_bits": FakeLGDO(
+            ak.Array([[np.nan, np.nan], [np.nan], [np.nan]])
+        ),
+    }
+    monkeypatch.setattr(validation_mod, "_read_groups", lambda *_a, **_k: raw)
+    data = ValidationData(FakeViewer(runs={"p01": {"r001": ["ts"]}}))
+
+    counts = data.period_qc_flags("p01")
+
+    assert counts["events"] == 2  # the forced event is left out
+    assert counts["failing"] == {101: 2, 201: 1}
+    assert counts["discharge"] == 1
+    assert set(counts["bits"]) == {"is_empty_bits"}  # the NaN class is left out
+    flags, table = qc_flag_table(counts, {"is_empty_bits": ["flag_a", "flag_b"]})
+    assert flags == ["flag_a", "flag_b"]
+    assert table[101] == {"flag_a": 1, "flag_b": 1}
+    assert table[201] == {"flag_a": 1, "flag_b": 1}
+    # a table narrower than the stored bits gets numbered labels instead
+    flags, _ = qc_flag_table(counts, {"is_empty_bits": ["only_one"]})
+    assert flags == ["is_empty bit 0", "is_empty bit 1"]
 
 
 def test_period_series_rejects_bad_bin_seconds():

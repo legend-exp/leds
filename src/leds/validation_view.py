@@ -13,10 +13,18 @@ from __future__ import annotations
 
 import numpy as np
 from bokeh.layouts import column
-from bokeh.models import ColumnDataSource, HoverTool, Span
-from bokeh.palettes import Category10
+from bokeh.models import (
+    ColorBar,
+    ColumnDataSource,
+    HoverTool,
+    LinearColorMapper,
+    LogColorMapper,
+    Span,
+)
+from bokeh.palettes import Category10, Category20, RdBu11, Turbo256, Viridis256
 from bokeh.plotting import figure
 
+from leds import calcheck
 from leds.validation import (
     GROUP_UNIT_LABEL,
     GROUP_UNIT_SECONDS,
@@ -32,6 +40,9 @@ PLOTS = (
     "qc survival",
     "calibration summary",
     "calibration detail",
+    "qc survival by string",
+    "qc failing flags",
+    "calibration check",
 )
 
 LEGEND_BLUE = "#1A2A5B"
@@ -178,6 +189,301 @@ def kline_rates(times_ms, rates, bin_label, log_y=True, scope="all strings"):
             fig.x_range = figs[0].x_range
         figs.append(fig)
     return column(*figs, sizing_mode="stretch_width")
+
+
+def qc_survival_by_string(times_ms, fracs, bin_label):
+    """Quality-cut survival fraction, one line per string on one figure."""
+    fig = figure(
+        x_axis_type="datetime",
+        height=380,
+        sizing_mode="stretch_width",
+        tools="pan,box_zoom,wheel_zoom,reset,save",
+        toolbar_location="right",
+        title=f"quality-cut survival fraction per string, forced/pulser removed "
+        f"({bin_label} bins; click a string to hide it)",
+    )
+    fig.yaxis.axis_label = "survival fraction"
+    columns = {"t": times_ms} | {f"s{s}": f for s, f in fracs.items()}
+    source = ColumnDataSource(columns)
+    palette = Category20[20]
+    for i, string in enumerate(fracs):
+        color = palette[i % len(palette)]
+        label = f"string {string}"
+        fig.line("t", f"s{string}", source=source, color=color, legend_label=label)
+        fig.scatter(
+            "t",
+            f"s{string}",
+            source=source,
+            color=color,
+            size=3,
+            legend_label=label,
+            name=f"s{string}",
+        )
+    if fracs:
+        fig.add_tools(
+            HoverTool(
+                renderers=[r for r in fig.renderers if r.name],
+                tooltips=[
+                    ("string", "$name"),
+                    ("time", "@t{%F %T}"),
+                    ("survival", "@$name{0.0000}"),
+                ],
+                formatters={"@t": "datetime"},
+            )
+        )
+        fig.legend.click_policy = "hide"
+        fig.legend.ncols = 2
+        fig.add_layout(fig.legend[0], "right")
+    else:
+        fig.title.text += "  (no per-string quality flags)"
+    return fig
+
+
+def qc_failing_flags(rows, flags, table, counts, period):
+    """Detectors x QC flags: how often each flag fails, per physics event.
+
+    ``rows`` is ``[(label, rawid)]`` in string order; ``table`` maps rawid to
+    ``{flag: unset count}`` over QC-failing hits (see
+    :func:`leds.validation.qc_flag_table`).
+    """
+    events = max(counts["events"], 1)
+    columns = ["fails QC", *flags]
+    xs, ys, frac, n = [], [], [], []
+    for label, rid in rows:
+        row = {"fails QC": counts["failing"].get(rid, 0), **table.get(rid, {})}
+        for col in columns:
+            xs.append(col)
+            ys.append(label)
+            c = row.get(col, 0)
+            n.append(c)
+            frac.append(c / events if c else np.nan)
+    positive = [f for f in frac if f == f]
+    mapper = LogColorMapper(
+        palette=Viridis256,
+        low=min(positive, default=1e-6),
+        high=max(positive, default=1.0),
+        nan_color="#F2F2F2",
+    )
+    source = ColumnDataSource({"x": xs, "y": ys, "frac": frac, "n": n})
+    labels = [label for label, _ in rows]
+    dd = counts.get("discharge")
+    fig = figure(
+        x_range=columns,
+        y_range=list(reversed(labels)),
+        height=15 * len(labels) + 170,
+        sizing_mode="stretch_width",
+        tools="hover,save",
+        toolbar_location="right",
+        x_axis_location="above",
+        title=f"QC flags failing, per physics event, {period} "
+        f"({counts['events']} events"
+        + (f"; delayed discharge in {dd / events:.2%}" if dd is not None else "")
+        + ")",
+        tooltips=[
+            ("detector", "@y"),
+            ("flag", "@x"),
+            ("events", "@n"),
+            ("fraction", "@frac{0.000%}"),
+        ],
+    )
+    fig.rect(
+        "x",
+        "y",
+        1,
+        1,
+        source=source,
+        line_color="white",
+        fill_color={"field": "frac", "transform": mapper},
+    )
+    fig.add_layout(ColorBar(color_mapper=mapper, title="fraction", width=10), "right")
+    fig.xaxis.major_label_orientation = 0.9
+    fig.axis.major_label_text_font_size = "9px"
+    fig.grid.grid_line_color = None
+    fig.axis.axis_line_color = None
+    return fig
+
+
+#: Shape match below which a cell is marked "?" (median is ~0.8).
+MATCH_POOR = 0.3
+
+
+def calibration_check(data, err, match, detector, sections, progress):
+    """Every detector x cal run (energy-scale error), then one detector's runs.
+
+    ``data`` is :meth:`leds.calcheck.CalCheck.spectra`; ``err``/``match`` the
+    ``(n_det, n_run)`` results of :func:`leds.calcheck.scale_match`;
+    ``detector`` the drill-down's detector name; ``progress`` ``(uncut,
+    section data, runs)`` built. Returns ``(layout, overview_source)``: a
+    tap on a cell selects that detector, through the source's selection.
+    """
+    runs, dets, ready = data["runs"], data["dets"], data["ready"]
+    labels = [d[0] for d in dets]
+    names = [d[1] for d in dets]
+    sel = names.index(detector) if detector in names else 0
+    xs, ys, v, err_t, match_t, mark, det_i = [], [], [], [], [], [], []
+    for i, label in enumerate(labels):
+        for j, run in enumerate(runs):
+            e, m = err[i, j], match[i, j]
+            xs.append(run)
+            ys.append(label)
+            v.append(float(np.clip(e, -0.5, 0.5)) if e == e else np.nan)
+            err_t.append(f"{e:+.2f} %" if e == e else "--")
+            match_t.append(f"{m:.2f}" if m == m else "--")
+            if not ready[i, j]:
+                mark.append("…")
+            elif e != e:
+                mark.append("")
+            else:
+                mark.append("?" if m < MATCH_POOR else "")
+            det_i.append(i)
+    source = ColumnDataSource(
+        {
+            "x": xs,
+            "y": ys,
+            "v": v,
+            "err": err_t,
+            "match": match_t,
+            "t": mark,
+            "det": det_i,
+        }
+    )
+    mapper = LinearColorMapper(
+        palette=list(reversed(RdBu11)), low=-0.5, high=0.5, nan_color="#C9CED3"
+    )
+    cut = f"sections: {', '.join(sections)}" if sections else "no cuts"
+    uncut, cuts_ready, n = progress
+    state = f"{(cuts_ready if sections else uncut)}/{n} cal runs ready"
+    overview = figure(
+        x_range=runs,
+        y_range=list(reversed(labels)),
+        height=14 * len(labels) + 120,
+        sizing_mode="stretch_width",
+        tools="tap,save",
+        toolbar_location="right",
+        x_axis_location="above",
+        title=f"energy-scale error from the whole spectrum ({cut}; {state}); "
+        f"? = poor match, … = building; click a cell",
+    )
+    overview.rect(
+        "x",
+        "y",
+        1,
+        1,
+        source=source,
+        line_color="white",
+        fill_color={"field": "v", "transform": mapper},
+        nonselection_fill_alpha=1.0,
+        selection_line_color="black",
+        selection_line_width=2,
+    )
+    overview.text(
+        "x",
+        "y",
+        text="t",
+        source=source,
+        text_align="center",
+        text_baseline="middle",
+        text_font_size="10px",
+    )
+    overview.rect(
+        x=runs,
+        y=[labels[sel]] * len(runs),
+        width=1,
+        height=1,
+        fill_alpha=0,
+        line_color="#222222",
+        line_width=1.5,
+    )
+    overview.add_tools(
+        HoverTool(
+            tooltips=[
+                ("detector", "@y"),
+                ("cal run", "@x"),
+                ("scale error", "@err"),
+                ("match", "@match"),
+            ]
+        )
+    )
+    overview.add_layout(ColorBar(color_mapper=mapper, title="%", width=10), "right")
+    overview.xaxis.major_label_orientation = 1.0
+    overview.axis.major_label_text_font_size = "9px"
+    overview.grid.grid_line_color = None
+    overview.axis.axis_line_color = None
+
+    # drill-down: the selected detector, every cal run
+    rows = np.array(
+        [calcheck.coarsen(data["counts"][sel, j]) for j in range(len(runs))]
+    )
+    logc = np.log10(1 + rows)
+    peak = logc.max(axis=1, keepdims=True)
+    image = np.divide(logc, peak, out=np.zeros_like(logc), where=peak > 0)
+    e_max = calcheck.E_MAX
+    waterfall = figure(
+        height=13 * len(runs) + 100,
+        sizing_mode="stretch_width",
+        x_range=(0, e_max),
+        y_range=(0, len(runs)),
+        tools="xpan,xwheel_zoom,reset,save",
+        toolbar_location="right",
+        title=f"{labels[sel]}: every cal run (rows), log counts per row ({cut})",
+    )
+    waterfall.image(
+        image=[image],
+        x=0,
+        y=0,
+        dw=e_max,
+        dh=len(runs),
+        color_mapper=LinearColorMapper(palette=Viridis256, low=0, high=1),
+    )
+    waterfall.yaxis.ticker = [k + 0.5 for k in range(len(runs))]
+    waterfall.yaxis.major_label_overrides = {k + 0.5: r for k, r in enumerate(runs)}
+    waterfall.yaxis.major_label_text_font_size = "9px"
+    waterfall.xaxis.axis_label = "energy (keV)"
+
+    centers = (np.arange(rows.shape[1]) + 0.5) * calcheck.DISPLAY_BIN
+    palette = [
+        Turbo256[int(20 + 200 * k / max(len(runs) - 1, 1))] for k in range(len(runs))
+    ]
+    lines = figure(
+        height=360,
+        sizing_mode="stretch_width",
+        x_range=waterfall.x_range,
+        y_axis_type="log",
+        tools="xpan,xwheel_zoom,box_zoom,reset,save",
+        toolbar_location="right",
+        title=f"{labels[sel]}: one line per cal run (colour = run order)",
+    )
+    lines.multi_line(
+        xs=[centers] * len(runs),
+        ys=[np.maximum(r, 0.5) for r in rows],
+        line_color=palette,
+        line_alpha=0.8,
+    )
+    lines.xaxis.axis_label = "energy (keV)"
+    lines.yaxis.axis_label = f"counts / {calcheck.DISPLAY_BIN:g} keV"
+    for fig in (waterfall, lines):
+        for e in calcheck.TH_LINES:
+            fig.add_layout(
+                Span(
+                    location=e,
+                    dimension="height",
+                    line_color="#888888",
+                    line_dash="dotted",
+                    line_alpha=0.8,
+                )
+            )
+    notes = []
+    if data["errors"]:
+        notes.append(
+            "unavailable: " + "; ".join(f"{r}: {e}" for r, e in data["errors"].items())
+        )
+    if data["missing"].get(labels[sel]):
+        notes.append(
+            f"not applied for {labels[sel]}: {', '.join(sorted(data['missing'][labels[sel]]))}"
+        )
+    if notes:
+        lines.title.text += "  (" + " | ".join(notes) + ")"
+    return column(overview, waterfall, lines, sizing_mode="stretch_width"), source
 
 
 #: Rate-plot label -> builder(times_ms, rates, bin_label).
