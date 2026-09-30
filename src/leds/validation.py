@@ -15,6 +15,7 @@ decides which cal run applies), not from lh5 data: the fitted peak centroids
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import awkward as ak
@@ -56,6 +57,8 @@ PEAKS_SUMMARY = (2614.511, 583.191, 2103.511)
 #: Calibration energy parameter whose curve is displayed (the production
 #: energy estimator).
 ENERGY_PARAM = "cuspEmax_ctc_cal"
+#: Uncalibrated (ADC) input the calibration chain starts from.
+RAW_ENERGY = ENERGY_PARAM.removesuffix("_cal")
 
 #: Calibration par tiers to look in, preferred first, per event tier:
 #: partitioned event data (``pet``) is calibrated by the partition-level
@@ -496,16 +499,36 @@ class ValidationData:
         return tstamps[0] if tstamps else None
 
 
-# -- calibration curve math (pure functions over a parsed par_hit dict) --------
+# -- calibration curve math (pure functions over a parsed par_hit/pht dict) ----
 
 
-def _eval_cal(operation, x):
-    """Apply a par_hit calibration ``operation`` to ADC value(s) ``x``."""
-    var = ENERGY_PARAM.removesuffix("_cal")
-    out = ne.evaluate(
-        operation["expression"],
-        local_dict={var: np.asarray(x, dtype=float), **operation["parameters"]},
-    )
+def _cal_chain(operations):
+    """Steps ``(input, name, operation)`` from ``RAW_ENERGY`` to ``ENERGY_PARAM``.
+
+    ``par_hit`` has one step. ``par_pht`` has two: a per-run
+    ``cuspEmax_ctc_runcal`` of the ADC value, then the partition-level
+    ``cuspEmax_ctc_cal`` of that. Raises ``KeyError`` for anything else.
+    """
+    chain, name = [], ENERGY_PARAM
+    while len(chain) <= len(operations):
+        op = operations[name]
+        names = set(re.findall(r"[A-Za-z_]\w*", op["expression"]))
+        inputs = [v for v in names if v == RAW_ENERGY or v in operations]
+        if len(inputs) != 1 or inputs[0] == name:
+            break
+        chain.insert(0, (inputs[0], name, op))
+        if inputs[0] == RAW_ENERGY:
+            return chain
+        name = inputs[0]
+    msg = f"no single-input calibration chain from {RAW_ENERGY} to {ENERGY_PARAM}"
+    raise KeyError(msg)
+
+
+def _eval_cal(chain, x):
+    """Apply a calibration ``chain`` (see :func:`_cal_chain`) to ADC value(s) ``x``."""
+    out = np.asarray(x, dtype=float)
+    for var, _name, op in chain:
+        out = ne.evaluate(op["expression"], local_dict={var: out, **op["parameters"]})
     return np.asarray(out, dtype=float)
 
 
@@ -519,8 +542,9 @@ def cal_curve(pars, detector):
     Raises ``KeyError`` if the detector has no usable ecal results.
     """
     det = pars[detector]
-    operation = det["pars"]["operations"][ENERGY_PARAM]
-    pk_fits = det["results"]["ecal"][ENERGY_PARAM]["pk_fits"]
+    chain = _cal_chain(det["pars"]["operations"])
+    # the ADC peak fits are stored under the step that takes the ADC value
+    pk_fits = det["results"]["ecal"][chain[0][1]]["pk_fits"]
 
     peaks, mus, mu_errs = [], [], []
     for peak_key, fit in sorted(pk_fits.items(), key=lambda kv: float(kv[0])):
@@ -538,8 +562,8 @@ def cal_curve(pars, detector):
     peaks_arr = np.array(peaks)
     mus_arr = np.array(mus)
     mu_errs_arr = np.array(mu_errs)
-    cal_mu = _eval_cal(operation, mus_arr)
-    cal_err = np.abs(_eval_cal(operation, mus_arr + mu_errs_arr) - cal_mu)
+    cal_mu = _eval_cal(chain, mus_arr)
+    cal_err = np.abs(_eval_cal(chain, mus_arr + mu_errs_arr) - cal_mu)
     line_x = np.linspace(0.0, 1.1 * mus_arr.max(), 200)
     return {
         "peaks": peaks_arr,
@@ -549,8 +573,12 @@ def cal_curve(pars, detector):
         "cal_err": cal_err,
         "residual": cal_mu - peaks_arr,
         "line_x": line_x,
-        "line_y": _eval_cal(operation, line_x),
-        "expression": operation["expression"],
+        "line_y": _eval_cal(chain, line_x),
+        "expression": (
+            chain[0][2]["expression"]
+            if len(chain) == 1
+            else "; ".join(f"{name} = {op['expression']}" for _, name, op in chain)
+        ),
     }
 
 

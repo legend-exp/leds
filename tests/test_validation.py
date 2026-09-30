@@ -300,6 +300,24 @@ def test_cal_curve_linear():
     np.testing.assert_allclose(curve["line_y"], 0.5 * curve["line_x"], atol=1e-9)
 
 
+def test_cal_curve_pht_two_step_chain():
+    """par_pht: fits under the per-run step, the partition step applied on top."""
+    det = synthetic_pars()["V01"]
+    ops = det["pars"]["operations"]
+    ops["cuspEmax_ctc_runcal"] = ops.pop("cuspEmax_ctc_cal")
+    ops["cuspEmax_ctc_cal"] = {
+        "expression": "a + b * cuspEmax_ctc_runcal",
+        "parameters": {"a": 1.0, "b": 1.0},  # partition cal shifts by 1 keV
+    }
+    ecal = det["results"]["ecal"]
+    ecal["cuspEmax_ctc_runcal"] = ecal.pop("cuspEmax_ctc_cal")
+
+    curve = cal_curve({"V01": det}, "V01")
+
+    np.testing.assert_allclose(curve["residual"], 1.0, atol=1e-9)
+    assert "cuspEmax_ctc_runcal = a + b * cuspEmax_ctc" in curve["expression"]
+
+
 def test_cal_curve_no_valid_peaks():
     pars = synthetic_pars()
     for fit in pars["V01"]["results"]["ecal"]["cuspEmax_ctc_cal"]["pk_fits"].values():
