@@ -101,3 +101,35 @@ def test_a_failed_build_is_not_cached():
 
     assert cache.get("k", lambda: "v") == "v"
     assert not cache._building, "the in-flight lock must be released"
+
+
+def _wait_for_background():
+    from leds import _cache  # noqa: PLC0415
+
+    _cache._LATER.submit(lambda: None).result(timeout=10)
+
+
+def test_build_later_builds_once_in_the_background():
+    calls = []
+    cache = SharedLRU(4)
+
+    cache.build_later("k", lambda: calls.append(1) or "v")
+    cache.build_later("k", lambda: calls.append(1) or "v")  # already queued
+    _wait_for_background()
+    cache.build_later("k", lambda: calls.append(1) or "v")  # already built
+
+    assert cache.peek("k") == "v"
+    assert len(calls) == 1
+
+
+def test_build_later_caches_a_failure():
+    cache = SharedLRU(4)
+
+    def boom():
+        msg = "bad file"
+        raise OSError(msg)
+
+    cache.build_later("k", boom)
+    _wait_for_background()
+
+    assert cache.peek("k") == {"error": "OSError: bad file"}

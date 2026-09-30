@@ -31,7 +31,7 @@ from dbetto import AttrsDict, Props
 from dbetto.catalog import Catalog
 from lh5.io.exceptions import LH5DecodeError
 
-from leds._cache import CAL_PARS, VALIDATION_SUMMARIES
+from leds._cache import CAL_PARS, VALIDATION_LIGHT, VALIDATION_SUMMARIES
 
 #: Storage resolution of the per-run summaries. The UI bin widths below are
 #: all multiples of this (and divide a day, so the day-aligned base axis
@@ -79,6 +79,17 @@ EVT_FIELDS = {
 }
 EVT_NESTED = ("geds/quality/is_bb_like", "geds/psd/is_bb_like")
 
+#: What the trigger, multiplicity and qc plots of the whole array need: about
+#: a third of the reading of EVT_FIELDS, so a first Validation view is quick.
+LIGHT_FIELDS = {
+    "trigger": ("timestamp", "is_forced"),
+    "coincident": ("puls", "muon", "muon_offline"),
+    "geds": ("multiplicity",),
+}
+LIGHT_NESTED = ("geds/quality/is_bb_like",)
+#: Series groups a light summary holds.
+LIGHT_GROUPS = ("trigger", "multiplicity", "qc")
+
 #: Read only for the failing-flags plot, in their own pass, so the rate
 #: summaries do not pay for them: the physics-event flags, and per
 #: QC-failing hit its rawid and one bitmask per waveform class.
@@ -94,6 +105,12 @@ QC_FLAG_FIELDS = {
         "is_delayed_discharge",
     ),
 }
+
+#: Marks a summary not built yet (a built one can be ``None``: an empty run).
+_NOT_BUILT = object()
+
+_ALL_EVT_KEYS = [f"{sub}/{f}" for sub, fields in EVT_FIELDS.items() for f in fields]
+_ALL_EVT_KEYS += list(EVT_NESTED)
 
 #: evt bitmask field -> the hit-tier candidate whose ``aggregations`` table
 #: names its bits (bit set = that flag passed).
@@ -272,11 +289,19 @@ class ValidationData:
         Each of the run's ~150 files is opened once for all fields, not once
         per field. Fields a cycle lacks come back as ``None``.
         """
+        return self._read_columns(period, run, EVT_FIELDS, EVT_NESTED)
+
+    def _light_columns(self, period, run):
+        """:meth:`_columns` for the light summary: ``None`` for the rest."""
+        return self._read_columns(period, run, LIGHT_FIELDS, LIGHT_NESTED)
+
+    def _read_columns(self, period, run, spec, nested):
         group = self.viewer.group
         files = self.viewer._run_files(period, run)
         if not files:
             return {"timestamp": np.empty(0)}  # _summary skips an empty run
-        raw = _read_groups(group, files, EVT_FIELDS, EVT_NESTED)
+        raw = _read_groups(group, files, spec, nested)
+        raw = {k: raw.get(k) for k in _ALL_EVT_KEYS} | raw
         if raw["trigger/timestamp"] is None:
             msg = f"no {group}/trigger/timestamp in {period} {run}"
             raise KeyError(msg)
@@ -542,55 +567,67 @@ class ValidationData:
                 total["discharge"] += part["discharge"]
         return total
 
-    def _summary(self, period, run):
+    def _summary_key(self, period, run):
+        files = tuple(str(f) for f in self.viewer._run_files(period, run))
+        return (self.viewer.cycle_key, period, run, files)
+
+    def _summary(self, period, run, light=False):
         """Binned counts of one run at base resolution, for every scope.
 
         ``series`` holds the whole-array histograms, ``strings`` the same
         series per string as ``(time, string)`` histograms (``None`` without
         ``geds/rawid``). Shared across sessions: an entry is ~2 MB but each is
         the reduction of a whole run's evt columns, so building one is the
-        expensive part of a first visit to the Validation tab.
+        expensive part of a first visit to the Validation tab. ``light`` only
+        holds the ``LIGHT_GROUPS`` series of the whole array, for about a
+        third of the reading; a full summary serves it too once built.
         """
-        files = tuple(str(f) for f in self.viewer._run_files(period, run))
-
-        def build():
-            d = self._columns(period, run)
-            t = d["timestamp"]
-            if t.size == 0:
-                return None
-            # day-aligned absolute axis: every BIN_WIDTHS factor divides it
-            # exactly, and bins of different runs line up with each other
-            t0 = math.floor(t.min() / _DAY) * _DAY
-            t1 = math.ceil(t.max() / _DAY) * _DAY
-            t1 = max(t1, t0 + _DAY)
-            axis = bh.axis.Regular(int((t1 - t0) / BASE_BIN_SECONDS), t0, t1)
-            masks = self._series_masks(d)
-            series = {}
-            for skey, mask in masks.items():
-                if mask is None:
-                    series[skey] = None
-                    continue
-                h = bh.Histogram(axis)
-                h.fill(t[mask])
-                series[skey] = h
-            strings = None
-            if d.get("rawid") is not None:
-                string_rawids = self._string_map(period, run)[0]
-                strings = self._string_hists(d, masks, axis, string_rawids)
-            # seconds of data coverage per bin (clipped overlap with the
-            # run's [first, last] timestamp); gaps between the run's DAQ
-            # cycles are not subtracted -- rates average over them
-            edges = axis.edges
-            exposure = bh.Histogram(axis, storage=bh.storage.Double())
-            exposure.view()[:] = np.clip(
-                np.minimum(edges[1:], t.max()) - np.maximum(edges[:-1], t.min()),
-                0.0,
-                None,
+        key = self._summary_key(period, run)
+        if light:
+            full = VALIDATION_SUMMARIES.peek(key, _NOT_BUILT)
+            if full is not _NOT_BUILT:
+                return full
+            return VALIDATION_LIGHT.get(
+                key, lambda: self._build_summary(period, run, True)
             )
-            return {"series": series, "strings": strings, "exposure": exposure}
+        return VALIDATION_SUMMARIES.get(key, lambda: self._build_summary(period, run))
 
-        key = (self.viewer.cycle_key, period, run, files)
-        return VALIDATION_SUMMARIES.get(key, build)
+    def _build_summary(self, period, run, light=False):
+        """Reduce one run (see :meth:`_summary`)."""
+        d = self._light_columns(period, run) if light else self._columns(period, run)
+        t = d["timestamp"]
+        if t.size == 0:
+            return None
+        # day-aligned absolute axis: every BIN_WIDTHS factor divides it
+        # exactly, and bins of different runs line up with each other
+        t0 = math.floor(t.min() / _DAY) * _DAY
+        t1 = math.ceil(t.max() / _DAY) * _DAY
+        t1 = max(t1, t0 + _DAY)
+        axis = bh.axis.Regular(int((t1 - t0) / BASE_BIN_SECONDS), t0, t1)
+        masks = self._series_masks(d)
+        series = {}
+        for skey, mask in masks.items():
+            if mask is None:
+                series[skey] = None
+                continue
+            h = bh.Histogram(axis)
+            h.fill(t[mask])
+            series[skey] = h
+        strings = None
+        if d.get("rawid") is not None:
+            string_rawids = self._string_map(period, run)[0]
+            strings = self._string_hists(d, masks, axis, string_rawids)
+        # seconds of data coverage per bin (clipped overlap with the
+        # run's [first, last] timestamp); gaps between the run's DAQ
+        # cycles are not subtracted -- rates average over them
+        edges = axis.edges
+        exposure = bh.Histogram(axis, storage=bh.storage.Double())
+        exposure.view()[:] = np.clip(
+            np.minimum(edges[1:], t.max()) - np.maximum(edges[:-1], t.min()),
+            0.0,
+            None,
+        )
+        return {"series": series, "strings": strings, "exposure": exposure}
 
     @staticmethod
     def _scope_counts(summary, key, string, factor):
@@ -611,6 +648,64 @@ class ValidationData:
 
     # -- period assembly ------------------------------------------------------
 
+    @staticmethod
+    def _light_enough(string, keys):
+        """Whether the light summaries hold every series asked for."""
+        return (
+            string is None
+            and keys is not None
+            and all(k[0] in LIGHT_GROUPS for k in keys)
+        )
+
+    def _ready_summary(self, period, run, light):
+        """The run's summary if built (else ``_NOT_BUILT``, and queue it)."""
+        key = self._summary_key(period, run)
+        value = VALIDATION_SUMMARIES.peek(key, _NOT_BUILT)
+        if value is _NOT_BUILT and light:
+            value = VALIDATION_LIGHT.peek(key, _NOT_BUILT)
+        if value is _NOT_BUILT:
+            cache = VALIDATION_LIGHT if light else VALIDATION_SUMMARIES
+            cache.build_later(key, lambda: self._build_summary(period, run, light))
+        return value
+
+    def summaries_ready(self, period, string=None, keys=None):
+        """``(built, runs)``: how many of the period's summaries are ready."""
+        light = self._light_enough(string, keys)
+        runs = sorted(self.viewer.available_runs().get(period, {}))
+        built = 0
+        for run in runs:
+            key = self._summary_key(period, run)
+            if VALIDATION_SUMMARIES.peek(key, _NOT_BUILT) is not _NOT_BUILT or (
+                light and VALIDATION_LIGHT.peek(key, _NOT_BUILT) is not _NOT_BUILT
+            ):
+                built += 1
+        return built, len(runs)
+
+    def period_series_so_far(self, period, bin_seconds, string=None, keys=None):
+        """:meth:`period_series` from the runs built so far, never waiting.
+
+        Queues the missing runs in the background and returns ``(times_ms,
+        rates, (built, runs, errors))``, where ``errors`` lists the runs that
+        could not be read, with the reason.
+        """
+        light = self._light_enough(string, keys)
+        errors, built, runs = [], 0, 0
+
+        def summary_of(run):
+            nonlocal built, runs
+            runs += 1
+            value = self._ready_summary(period, run, light)
+            if value is _NOT_BUILT:
+                return None
+            built += 1
+            if isinstance(value, dict) and "error" in value:
+                errors.append(f"{run}: {value['error']}")
+                return None
+            return value
+
+        times, rates = self._assemble(period, bin_seconds, string, keys, summary_of)
+        return times, rates, (built, runs, errors)
+
     def period_series(self, period, bin_seconds, string=None, keys=None):
         """Mass-normalised rates of every series over all runs of ``period``.
 
@@ -622,8 +717,18 @@ class ValidationData:
         rates are divided by the scope's ged mass (per run, from its
         channelmap). Rebinned from the cached base-resolution summaries; no
         file is re-read when ``bin_seconds`` changes. ``keys`` limits the
-        result to those series.
+        result to those series; when they are all in ``LIGHT_GROUPS`` of the
+        whole array, the light summaries are used.
         """
+        light = self._light_enough(string, keys)
+
+        def summary_of(run):
+            return self._summary(period, run, light)
+
+        return self._assemble(period, bin_seconds, string, keys, summary_of)
+
+    def _assemble(self, period, bin_seconds, string, keys, summary_of):
+        """The rate series of ``period`` from ``summary_of(run)`` per run."""
         if bin_seconds < BASE_BIN_SECONDS or bin_seconds % BASE_BIN_SECONDS:
             msg = (
                 f"bin_seconds must be a positive multiple of {BASE_BIN_SECONDS}, "
@@ -638,7 +743,7 @@ class ValidationData:
         chunks: dict = {k: [] for k in all_keys}
 
         for run in sorted(self.viewer.available_runs().get(period, {})):
-            summary = self._summary(period, run)
+            summary = summary_of(run)
             if summary is None:
                 continue
             mass = self._mass_kg(period, run, string)
@@ -690,16 +795,26 @@ class ValidationData:
             ]
         return []
 
-    def qc_survival_by_string(self, period, bin_seconds):
-        """``(times_ms, {string: survival fraction})`` over ``period``."""
+    def qc_survival_by_string(self, period, bin_seconds, wait=True):
+        """``(times_ms, {string: survival fraction}, progress)`` over ``period``.
+
+        With ``wait=False`` only the runs built so far are used (see
+        :meth:`period_series_so_far`); ``progress`` is then its
+        ``(built, runs, errors)``, else ``None``.
+        """
         keys = [("qc", "pass"), ("qc", "fail")]
-        times, fracs = np.array([]), {}
+        times, fracs, progress = np.array([]), {}, None
         for string in self.available_strings(period):
-            times, rates = self.period_series(period, bin_seconds, string, keys)
+            if wait:
+                times, rates = self.period_series(period, bin_seconds, string, keys)
+            else:
+                times, rates, progress = self.period_series_so_far(
+                    period, bin_seconds, string, keys
+                )
             frac = survival_fraction(*(rates[k] for k in keys))
             if frac is not None:
                 fracs[string] = frac
-        return times, fracs
+        return times, fracs, progress
 
     # -- calibration parameters ------------------------------------------------
 

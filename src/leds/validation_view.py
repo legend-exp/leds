@@ -17,6 +17,8 @@ from bokeh.models import (
     ColorBar,
     ColumnDataSource,
     HoverTool,
+    Legend,
+    LegendItem,
     LinearColorMapper,
     LogColorMapper,
     Span,
@@ -307,14 +309,17 @@ def qc_failing_flags(rows, flags, table, counts, period):
 MATCH_POOR = 0.3
 
 
-def calibration_check(data, err, match, detector, sections, progress):
+def calibration_check(data, err, match, detector, detail, sections, progress):
     """Every detector x cal run (energy-scale error), then one detector's runs.
 
-    ``data`` is :meth:`leds.calcheck.CalCheck.spectra`; ``err``/``match`` the
-    ``(n_det, n_run)`` results of :func:`leds.calcheck.scale_match`;
-    ``detector`` the drill-down's detector name; ``progress`` ``(uncut,
-    section data, runs)`` built. Returns ``(layout, overview_source)``: a
-    tap on a cell selects that detector, through the source's selection.
+    ``data`` is :meth:`leds.calcheck.CalCheck.spectra` (uncut: the grid is
+    always drawn without cuts); ``err``/``match`` the ``(n_det, n_run)``
+    results of :func:`leds.calcheck.scale_match`; ``detector`` the
+    drill-down's detector name; ``detail`` its
+    :meth:`~leds.calcheck.CalCheck.detector_spectra` with ``sections``
+    applied, or ``None`` for uncut; ``progress`` ``(uncut, section data,
+    runs)`` built. Returns ``(layout, overview_source)``: a tap on a cell
+    selects that detector, through the source's selection.
     """
     runs, dets, ready = data["runs"], data["dets"], data["ready"]
     labels = [d[0] for d in dets]
@@ -350,9 +355,7 @@ def calibration_check(data, err, match, detector, sections, progress):
     mapper = LinearColorMapper(
         palette=list(reversed(RdBu11)), low=-0.5, high=0.5, nan_color="#C9CED3"
     )
-    cut = f"sections: {', '.join(sections)}" if sections else "no cuts"
     uncut, cuts_ready, n = progress
-    state = f"{(cuts_ready if sections else uncut)}/{n} cal runs ready"
     overview = figure(
         x_range=runs,
         y_range=list(reversed(labels)),
@@ -361,8 +364,9 @@ def calibration_check(data, err, match, detector, sections, progress):
         tools="tap,save",
         toolbar_location="right",
         x_axis_location="above",
-        title=f"energy-scale error from the whole spectrum ({cut}; {state}); "
-        f"? = poor match, … = building; click a cell",
+        title=f"energy-scale error from the whole spectrum, no cuts "
+        f"({uncut}/{n} cal runs ready); ? = poor match, … = building; "
+        f"click a cell",
     )
     overview.rect(
         "x",
@@ -410,10 +414,17 @@ def calibration_check(data, err, match, detector, sections, progress):
     overview.grid.grid_line_color = None
     overview.axis.axis_line_color = None
 
-    # drill-down: the selected detector, every cal run
-    rows = np.array(
-        [calcheck.coarsen(data["counts"][sel, j]) for j in range(len(runs))]
-    )
+    # drill-down: the selected detector, every cal run, with the sections
+    if detail is None:
+        counts, row_ready = data["counts"][sel], ready[sel]
+        cut = "no cuts"
+    else:
+        counts, row_ready = detail["counts"], detail["ready"]
+        cut = (
+            f"sections: {', '.join(sections)}; "
+            f"{cuts_ready}/{n} cal runs with section data"
+        )
+    rows = np.array([calcheck.coarsen(counts[j]) for j in range(len(runs))])
     logc = np.log10(1 + rows)
     peak = logc.max(axis=1, keepdims=True)
     image = np.divide(logc, peak, out=np.zeros_like(logc), where=peak > 0)
@@ -445,20 +456,27 @@ def calibration_check(data, err, match, detector, sections, progress):
         Turbo256[int(20 + 200 * k / max(len(runs) - 1, 1))] for k in range(len(runs))
     ]
     lines = figure(
-        height=360,
+        height=max(380, 22 * ((len(runs) + 1) // 2) + 60),
         sizing_mode="stretch_width",
         x_range=waterfall.x_range,
         y_axis_type="log",
         tools="xpan,xwheel_zoom,box_zoom,reset,save",
         toolbar_location="right",
-        title=f"{labels[sel]}: one line per cal run (colour = run order)",
+        title=f"{labels[sel]}: one line per cal run ({cut}); "
+        f"click a run in the legend to hide it",
     )
-    lines.multi_line(
-        xs=[centers] * len(runs),
-        ys=[np.maximum(r, 0.5) for r in rows],
-        line_color=palette,
-        line_alpha=0.8,
-    )
+    items = []
+    for j, run in enumerate(runs):
+        if not row_ready[j]:
+            continue
+        line = lines.line(
+            centers, np.maximum(rows[j], 0.5), line_color=palette[j], line_alpha=0.8
+        )
+        items.append(LegendItem(label=run, renderers=[line]))
+    if items:
+        legend = Legend(items=items, click_policy="hide", ncols=2)
+        legend.label_text_font_size = "9px"
+        lines.add_layout(legend, "right")
     lines.xaxis.axis_label = "energy (keV)"
     lines.yaxis.axis_label = f"counts / {calcheck.DISPLAY_BIN:g} keV"
     for fig in (waterfall, lines):
@@ -473,14 +491,13 @@ def calibration_check(data, err, match, detector, sections, progress):
                 )
             )
     notes = []
-    if data["errors"]:
+    errors = data["errors"] | ({} if detail is None else detail["errors"])
+    if errors:
         notes.append(
-            "unavailable: " + "; ".join(f"{r}: {e}" for r, e in data["errors"].items())
+            "unavailable: " + "; ".join(f"{r}: {e}" for r, e in errors.items())
         )
-    if data["missing"].get(labels[sel]):
-        notes.append(
-            f"not applied for {labels[sel]}: {', '.join(sorted(data['missing'][labels[sel]]))}"
-        )
+    if detail is not None and detail["missing"]:
+        notes.append(f"not applied: {', '.join(sorted(detail['missing']))}")
     if notes:
         lines.title.text += "  (" + " | ".join(notes) + ")"
     return column(overview, waterfall, lines, sizing_mode="stretch_width"), source

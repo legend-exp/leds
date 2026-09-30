@@ -23,9 +23,14 @@ from __future__ import annotations
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 #: Sentinel distinguishing "absent" from a cached ``None``.
 _MISS = object()
+
+#: Builds entries queued with :meth:`SharedLRU.build_later`, one at a time
+#: per worker, so a view can draw what is ready instead of waiting for all.
+_LATER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="leds-build")
 
 
 def _env_int(name, default):
@@ -62,6 +67,7 @@ class SharedLRU:
         self.misses = 0
         self._entries: dict = {}  # key -> (value, stored_at); insertion-ordered
         self._building: dict = {}  # key -> Lock held while a factory runs
+        self._queued: set = set()  # keys waiting in build_later
         self._lock = threading.Lock()
 
     def _fresh(self, key):
@@ -110,6 +116,32 @@ class SharedLRU:
             with self._lock:
                 self._store(key, value)
             return value
+
+    def build_later(self, key, factory):
+        """Queue building ``key`` in the background, once.
+
+        A failure is cached as ``{"error": reason}``, so a broken input is not
+        re-read on every redraw.
+        """
+        with self._lock:
+            if key in self._queued or self._fresh(key) is not _MISS:
+                return
+            self._queued.add(key)
+
+        def safe():
+            try:
+                return factory()
+            except Exception as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
+
+        def job():
+            try:
+                self.get(key, safe)
+            finally:
+                with self._lock:
+                    self._queued.discard(key)
+
+        _LATER.submit(job)
 
     def peek(self, key, default=None):
         """The cached value for ``key``, or ``default``; never builds one."""
@@ -178,12 +210,17 @@ VALIDATION_SUMMARIES = SharedLRU(
     name="validation_summaries",
 )
 
-#: Calibration check, per cal run (keyed by the files read): per-detector
-#: uncut 0.5 keV spectra (~1.4 MB), and the is_valid_cal section data (~2 MB:
-#: a histogram of passing hits plus the few failing hits). 32 runs is about
-#: one period. Files are immutable, so no TTL.
+#: The same for the light summaries (trigger, multiplicity and qc series of
+#: the whole array only): ~0.07 MB each and 2-3x cheaper to build, so a first
+#: Validation view draws quickly.
+VALIDATION_LIGHT = SharedLRU(256, ttl=METADATA_TTL, name="validation_light")
+
+#: Calibration check, keyed by the files read: per cal run, every detector's
+#: uncut 0.5 keV spectrum (~1.4 MB; 32 runs is about one period), and per
+#: detector and cal run the is_valid_cal section data (~40 kB: a histogram of
+#: passing hits plus the few failing ones). Files are immutable, so no TTL.
 CAL_CHECK_SPECTRA = SharedLRU(32, name="cal_check_spectra")
-CAL_CHECK_CUTS = SharedLRU(32, name="cal_check_cuts")
+CAL_CHECK_CUTS = SharedLRU(512, name="cal_check_cuts")
 
 #: Every cache above, for the warm-up path and for tests.
 ALL = (
@@ -197,6 +234,7 @@ ALL = (
     N_EVENTS,
     RUN_SPECTRA,
     VALIDATION_SUMMARIES,
+    VALIDATION_LIGHT,
     CAL_CHECK_SPECTRA,
     CAL_CHECK_CUTS,
 )

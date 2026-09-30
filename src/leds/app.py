@@ -174,6 +174,30 @@ def build_header_links():
     )
 
 
+def _plot_keys(plot="trigger rates"):
+    """The rate series a rate plot draws (light ones need less reading)."""
+    groups = {
+        "trigger rates": ("trigger",),
+        "multiplicity rates": ("multiplicity",),
+        "qc survival": ("qc",),
+        "K-line rates": tuple(validation.K_LINES),
+    }[plot]
+    return [(g, label) for g in groups for label in validation.RATE_GROUPS[g]]
+
+
+def _note_progress(fig, progress):
+    """Add "k of n runs read so far" (and unreadable runs) to the titles."""
+    built, runs, errors = progress or (0, 0, [])
+    text = f"  ({built} of {runs} runs read so far)" if built < runs else ""
+    if errors:
+        text += f"  (unreadable: {'; '.join(errors)})"
+    if text:
+        for f in getattr(fig, "children", None) or [fig]:
+            if getattr(f, "title", None) is not None:
+                f.title.text += text
+    return fig
+
+
 class EventDisplay(param.Parameterized):
     """Interactive detector-array event view backed by an :class:`EventViewer`.
 
@@ -414,6 +438,9 @@ class EventDisplay(param.Parameterized):
         )
         self._cal_cache: dict = {}  # (cycle, period, run) -> calibration residuals
         self._prefetch = pn.state.curdoc is not None  # server sessions only
+        # draw from what is built and redraw as more is: needs a server's
+        # periodic callback, so scripts and tests wait for the data instead
+        self._progressive = pn.state.curdoc is not None
         self.validation_bin_select = pn.widgets.Select.from_param(
             self.param.validation_bin_width, name="Bin width", width=90
         )
@@ -426,15 +453,24 @@ class EventDisplay(param.Parameterized):
         self.validation_detector_select = pn.widgets.Select.from_param(
             self.param.validation_detector, name="Detector", width=120, visible=False
         )
+        # calibration check: is_valid_cal sections for the drill-down spectra
         self.validation_sections_select = pn.widgets.CheckBoxGroup.from_param(
             self.param.validation_cal_sections,
             name="is_valid_cal sections",
             inline=True,
-            visible=False,
-            margin=(28, 5, 5, 5),
         )
-        self._cal_check_poll = None  # periodic refresh while cal data builds
-        self._cal_check_drawn = None  # progress when last drawn
+        all_sections = pn.widgets.Button(
+            name="Apply is_valid_cal", color="primary", width=150
+        )
+        all_sections.on_click(self._on_all_sections)
+        no_sections = pn.widgets.Button(name="Clear", width=70)
+        no_sections.on_click(self._on_no_sections)
+        self.validation_sections_row = pn.Row(
+            all_sections, no_sections, self.validation_sections_select, visible=False
+        )
+        self._validation_poll = None  # periodic redraw while a plot's data builds
+        self._cal_grid = None  # (key, spectra, err, match) of the drawn grid
+        self._validation_building = False
         self.validation_tab = pn.Column(
             pn.Row(
                 pn.widgets.Select.from_param(
@@ -444,8 +480,8 @@ class EventDisplay(param.Parameterized):
                 self.validation_string_select,
                 self.validation_log_toggle,
                 self.validation_detector_select,
-                self.validation_sections_select,
             ),
+            self.validation_sections_row,
             self.validation_area,
             sizing_mode="stretch_width",
             min_height=600,
@@ -700,14 +736,13 @@ class EventDisplay(param.Parameterized):
             if (self.validation_data, self.period, self.run) != (data, period, run):
                 return  # the user moved on before this started
             try:
-                data.period_series(period, bin_seconds)
+                # queues the light summaries of the default plot
+                data.period_series_so_far(period, bin_seconds, keys=_plot_keys())
                 if run:
                     data.load_cal_pars(period, run)
-                cal_check.ensure(period, cuts=False)  # queues its own builds
             except Exception:
                 pass  # the tab reports it when opened
 
-        cal_check = self.cal_check
         _PREFETCH.submit(job)
 
     @param.depends("production_cycle", watch=True)
@@ -1162,14 +1197,13 @@ class EventDisplay(param.Parameterized):
             "calibration detail",
             "calibration check",
         )
-        self.validation_sections_select.visible = plot == "calibration check"
-        if plot != "calibration check":
-            self._stop_cal_check_poll()
+        self.validation_sections_row.visible = plot == "calibration check"
         if not is_cal:
             self._refresh_validation_strings()
         if self._tab_is_current(TAB_VALIDATION, self._validation_state()):
             return
         self.validation_tab.loading = True
+        self._validation_building = False
         try:
             fig = self._validation_figure(plot)
         except _Unavailable as exc:
@@ -1177,6 +1211,7 @@ class EventDisplay(param.Parameterized):
             # nothing to draw is an answer for this state; don't redo the
             # lookup until something it depends on changes
             self._tab_drawn(TAB_VALIDATION, self._validation_state())
+            self._sync_validation_poll()
             return
         except (KeyError, ValueError, FileNotFoundError, OSError) as exc:
             self._show_validation_note(f"{type(exc).__name__}: {exc}")
@@ -1194,6 +1229,7 @@ class EventDisplay(param.Parameterized):
         # re-read the state: building a calibration plot can re-point
         # validation_detector at the run's first detector
         self._tab_drawn(TAB_VALIDATION, self._validation_state())
+        self._sync_validation_poll()
 
     def _show_validation_note(self, text):
         """Show why the selected validation plot cannot be drawn, in the tab."""
@@ -1217,21 +1253,22 @@ class EventDisplay(param.Parameterized):
             self.validation_string,
             self.validation_detector,
             tuple(self.validation_cal_sections),
-            self._cal_check_progress(),
+            self._validation_progress(),
         )
 
     def _validation_figure(self, plot):
         """Build the requested validation figure (from cached data)."""
         if plot == "qc survival by string":
-            times, fracs = self.validation_data.qc_survival_by_string(
-                self.period, validation.BIN_WIDTHS[self.validation_bin_width]
+            times, fracs, progress = self.validation_data.qc_survival_by_string(
+                self.period,
+                validation.BIN_WIDTHS[self.validation_bin_width],
+                wait=not self._progressive,
             )
-            if times.size == 0:
-                msg = f"no event data in period {self.period}"
-                raise _Unavailable(msg)
-            return validation_view.qc_survival_by_string(
+            self._check_built(times, progress)
+            fig = validation_view.qc_survival_by_string(
                 times, fracs, self.validation_bin_width
             )
+            return _note_progress(fig, progress)
         if plot == "qc failing flags":
             counts = self.validation_data.period_qc_flags(self.period)
             if counts is None:
@@ -1248,21 +1285,28 @@ class EventDisplay(param.Parameterized):
             return self._cal_check_figure()
         if plot in validation_view.RATE_BUILDERS:
             scope = self.validation_string
-            times, rates = self.validation_data.period_series(
+            args = (
                 self.period,
                 validation.BIN_WIDTHS[self.validation_bin_width],
-                string=None if scope == "all strings" else int(scope),
+                None if scope == "all strings" else int(scope),
+                _plot_keys(plot),
             )
-            if times.size == 0:
-                msg = f"no event data in period {self.period}"
-                raise _Unavailable(msg)
-            return validation_view.RATE_BUILDERS[plot](
+            if self._progressive:
+                times, rates, progress = self.validation_data.period_series_so_far(
+                    *args
+                )
+            else:
+                times, rates = self.validation_data.period_series(*args)
+                progress = None
+            self._check_built(times, progress)
+            fig = validation_view.RATE_BUILDERS[plot](
                 times,
                 rates,
                 self.validation_bin_width,
                 log_y=self.validation_log_y,
                 scope=scope if scope == "all strings" else f"string {scope}",
             )
+            return _note_progress(fig, progress)
 
         # calibration plots: the run's residuals are ~100 numexpr evaluations
         # and are needed to populate the detector selector, so they are cached
@@ -1312,57 +1356,96 @@ class EventDisplay(param.Parameterized):
             self._cal_cache.pop(next(iter(self._cal_cache)))
         return cached
 
-    def _cal_check_progress(self):
-        """Build progress of the calibration check, while it is shown."""
-        if self.validation_plot != "calibration check" or not self.period:
+    def _check_built(self, times, progress):
+        """Raise the note to show while none of the period's runs is built."""
+        built, runs, errors = progress or (0, 0, [])
+        self._validation_building = built < runs
+        if times.size:
+            return
+        if built < runs:
+            msg = (
+                f"reading the runs of {self.period}: {built} of {runs} done; "
+                "the plot appears as they finish"
+            )
+        else:
+            msg = f"no event data in period {self.period}"
+            if errors:
+                msg += f" (unreadable: {'; '.join(errors)})"
+        raise _Unavailable(msg)
+
+    def _validation_progress(self):
+        """How much of the shown plot's data is built (part of its state)."""
+        plot, period = self.validation_plot, self.period
+        if not period or self.viewer is None:
             return None
         try:
-            return self.cal_check.progress(self.period)
-        except Exception:  # no cal tier: the figure reports it
+            if plot in validation_view.RATE_BUILDERS or plot == "qc survival by string":
+                string = None
+                if (
+                    plot == "qc survival by string"
+                    or self.validation_string != "all strings"
+                ):
+                    string = -1  # any string: needs the full summaries
+                keys = None if plot == "qc survival by string" else _plot_keys(plot)
+                return self.validation_data.summaries_ready(period, string, keys)
+            if plot == "calibration check":
+                name = (
+                    self.validation_detector if self.validation_cal_sections else None
+                )
+                return self.cal_check.progress(period, name)
+        except Exception:  # the figure reports it
             return None
+        return None
 
     def _cal_check_figure(self):
         """Calibration check of every cal run in the period, from what is built."""
-        period = self.period
+        period, cc = self.period, self.cal_check
         try:
-            runs = self.cal_check.runs(period)
+            runs = cc.runs(period)
         except Exception as exc:
             msg = f"no cal data for this cycle ({type(exc).__name__}: {exc})"
             raise _Unavailable(msg) from exc
         if not runs:
             msg = f"no cal runs in period {period}"
             raise _Unavailable(msg)
-        self.cal_check.ensure(period, cuts=True)
-        labels = self.cal_check.section_labels(period)
-        if labels and list(self.param.validation_cal_sections.objects) != labels:
+        cc.ensure(period)
+        labels = cc.section_labels(period)
+        if list(self.param.validation_cal_sections.objects) != labels:
             self.param.validation_cal_sections.objects = labels
             kept = [s for s in self.validation_cal_sections if s in labels]
             self._set_quietly(validation_cal_sections=kept)
-        sections = tuple(self.validation_cal_sections)
-        data = self.cal_check.spectra(period, sections)
-        err, match = calcheck.scale_match(data["counts"].reshape(-1, calcheck.N_BINS))
+        # the grid only changes as more cal runs finish: reuse it meanwhile
+        grid_key = (self.production_cycle, period, cc.progress(period)[0])
+        if self._cal_grid is None or self._cal_grid[0] != grid_key:
+            data = cc.spectra(period)
+            flat = data["counts"].reshape(-1, calcheck.N_BINS)
+            self._cal_grid = (grid_key, data, *calcheck.scale_match(flat))
+        _key, data, err, match = self._cal_grid
         shape = data["ready"].shape
         names = [d[1] for d in data["dets"]]
         self.param.validation_detector.objects = names
         if self.validation_detector not in names:
             self._set_quietly(validation_detector=names[0] if names else None)
-        progress = self.cal_check.progress(period)
+        sections = tuple(self.validation_cal_sections)
+        detail = None
+        if sections:
+            cc.ensure_cuts(period, self.validation_detector)
+            detail = cc.detector_spectra(period, self.validation_detector, sections)
+        progress = cc.progress(period, self.validation_detector if sections else None)
+        uncut, cuts, n = progress
+        self._validation_building = uncut < n or bool(sections and cuts < n)
         layout, source = validation_view.calibration_check(
             data,
             err.reshape(shape),
             match.reshape(shape),
             self.validation_detector,
+            detail,
             sections,
             progress,
         )
         source.selected.on_change("indices", self._on_cal_cell)
         self._cal_check_names = names
         self._cal_check_source = source
-        uncut, cuts, n = progress
-        if (cuts if sections else uncut) < n:
-            self._start_cal_check_poll()
-        else:
-            self._stop_cal_check_poll()
         return layout
 
     def _on_cal_cell(self, _attr, _old, new):
@@ -1375,25 +1458,31 @@ class EventDisplay(param.Parameterized):
         det = self._cal_check_source.data["det"][new[0]]
         self.validation_detector = self._cal_check_names[det]
 
-    def _start_cal_check_poll(self):
-        if self._cal_check_poll is None and pn.state.curdoc is not None:
-            self._cal_check_poll = pn.state.add_periodic_callback(
-                self._poll_cal_check, period=5000
-            )
-
-    def _stop_cal_check_poll(self):
-        if self._cal_check_poll is not None:
-            self._cal_check_poll.stop()
-            self._cal_check_poll = None
+    @_serialized
+    def _on_all_sections(self, _event):
+        self.validation_cal_sections = list(self.param.validation_cal_sections.objects)
 
     @_serialized
-    def _poll_cal_check(self):
-        """Redraw while cal data builds; the progress is part of the state."""
-        if (
-            self.tabs.active != TAB_VALIDATION
-            or self.validation_plot != "calibration check"
-        ):
-            self._stop_cal_check_poll()
+    def _on_no_sections(self, _event):
+        self.validation_cal_sections = []
+
+    def _sync_validation_poll(self):
+        """Redraw every 5 s while the shown plot's data is still building."""
+        if self._validation_building and pn.state.curdoc is not None:
+            if self._validation_poll is None:
+                self._validation_poll = pn.state.add_periodic_callback(
+                    self._poll_validation, period=5000
+                )
+        elif self._validation_poll is not None:
+            self._validation_poll.stop()
+            self._validation_poll = None
+
+    @_serialized
+    def _poll_validation(self):
+        """Redraw if more is built; the progress is part of the state."""
+        if self.tabs.active != TAB_VALIDATION:
+            self._validation_building = False
+            self._sync_validation_poll()
             return
         self._guarded("validation", self._update_validation)
 

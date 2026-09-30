@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import yaml
 
+from leds import _cache, validation_view
 from leds import validation as validation_mod
-from leds import validation_view
 from leds.validation import (
     BIN_WIDTHS,
     K_LINES,
@@ -233,7 +233,7 @@ def test_qc_survival_by_string():
         {1: 2.0, 2: 4.0},
     )
 
-    times, fracs = data.qc_survival_by_string("p01", 3600)
+    times, fracs, _ = data.qc_survival_by_string("p01", 3600)
 
     assert set(fracs) == {1, 2}
     np.testing.assert_allclose(fracs[1][~np.isnan(fracs[1])], 1.0)  # e0, e2 pass
@@ -282,6 +282,59 @@ def test_qc_flag_counts_and_names(monkeypatch):
     # a table narrower than the stored bits gets numbered labels instead
     flags, _ = qc_flag_table(counts, {"is_empty_bits": ["only_one"]})
     assert flags == ["is_empty bit 0", "is_empty bit 1"]
+
+
+def test_light_summaries_match_the_full_ones():
+    t = T0 + np.arange(0, 3 * 3600, 7.0)
+    n = t.size
+    rng = np.random.default_rng(3)
+    cols = columns(
+        t,
+        forced=rng.random(n) < 0.1,
+        puls=rng.random(n) < 0.05,
+        muon=rng.random(n) < 0.02,
+        mult=rng.integers(0, 4, n).astype(np.uint16),
+        qc=rng.random(n) < 0.9,
+    )
+    heavy = ("rawid", "energy", "psd_bb", "spms")
+    data = make_data({"r001": cols})
+    data._light_columns = lambda _period, _run: cols | dict.fromkeys(heavy)  # type: ignore[method-assign]
+    keys = [
+        k
+        for k in validation_mod.RATE_GROUPS.items()
+        if k[0] in validation_mod.LIGHT_GROUPS
+    ]
+    keys = [(g, label) for g, labels in keys for label in labels]
+
+    light = data._summary("p01", "r001", light=True)
+    validation_mod.VALIDATION_SUMMARIES.clear()  # not served from the full one
+    full = data._summary("p01", "r001")
+
+    for k in keys:
+        np.testing.assert_array_equal(
+            light["series"][k].view(), full["series"][k].view()
+        )
+    assert light["strings"] is None
+
+
+def test_period_series_so_far_fills_in_without_waiting():
+    runs = {
+        f"r00{i}": columns(T0 + i * DAY + np.arange(0, 3600, 10.0)) for i in range(3)
+    }
+    data = make_data(runs)
+    data._light_columns = lambda _period, run: runs[run]  # type: ignore[method-assign]
+    keys = [("trigger", "all triggers")]
+
+    data.period_series_so_far("p01", 3600, keys=keys)  # queues all three runs
+    _cache._LATER.submit(lambda: None).result(timeout=10)  # let them build
+    times, rates, (built, total, errors) = data.period_series_so_far(
+        "p01", 3600, keys=keys
+    )
+
+    assert (built, total, errors) == (3, 3, [])
+    ref_times, ref_rates = data.period_series("p01", 3600, keys=keys)
+    np.testing.assert_array_equal(times, ref_times)
+    np.testing.assert_array_equal(rates[keys[0]], ref_rates[keys[0]])
 
 
 def test_period_series_rejects_bad_bin_seconds():
