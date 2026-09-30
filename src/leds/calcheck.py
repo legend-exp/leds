@@ -5,12 +5,13 @@ A few files of each cal run (``FILES_PER_RUN``, spread over the run) hold
 per-detector 0.5 keV histograms, cached and shared across sessions, and built
 in the background, one run at a time:
 
-- *uncut*, from the evt/pet tier (energy + rawid), ~1.5 s a run;
-- *section data* for ``is_valid_cal``, from 2 files of the hit/pht tier,
-  15-30 s a run cold:
-  per detector a histogram of the hits passing every section, plus the
-  energies and section bitmask of the few that fail one. Any AND of sections
-  is then exact without re-reading.
+- *uncut*, every detector, from the evt/pet tier (energy + rawid), ~1.5 s
+  a run: the overview grid and the drill-down without cuts;
+- *section data* for ``is_valid_cal``, one detector at a time, from the
+  hit/pht tier and only when sections are ticked for the drill-down, ~1 s a
+  run: a histogram of the hits passing every section, plus the energies and
+  section bitmask of the few that fail one. Any AND of sections is then exact
+  without re-reading.
 
 :func:`scale_match` compares each spectrum with the period's median spectrum
 in log-energy, where a gain error is a shift. It gives the energy-scale error
@@ -36,9 +37,6 @@ from leds.event_viewer import EventViewer
 from leds.validation import ENERGY_PARAM, _read_groups, load_par_files
 
 FILES_PER_RUN = 3
-# the hit tier is ~10x slower to read (all channels x ~14 fields): 2 files
-# (~35 k hits per detector) keep a period's section data to minutes
-CUT_FILES_PER_RUN = 2
 BIN = 0.5  # keV, stored spectra
 E_MAX = 3000.0
 N_BINS = int(E_MAX / BIN)
@@ -281,7 +279,7 @@ class CalCheck:
         if tier is None:
             return ()
         root = self.viewer._tier_root(tier) / period / run
-        return tuple(str(f) for f in pick_files(root.glob("*.lh5"), CUT_FILES_PER_RUN))
+        return tuple(str(f) for f in pick_files(root.glob("*.lh5")))
 
     def _build_spectra(self, period, run, rawids):
         files = self._evt_files(period, run)
@@ -361,85 +359,112 @@ class CalCheck:
 
     # -- queries: never block on a build ----------------------------------------------
 
-    def ensure(self, period, *, cuts=True):
-        """Queue the period's missing builds: uncut first, then section data."""
-        dets = self.detectors(period)
-        rawids = [d[2] for d in dets]
-        runs = self.runs(period)
-        for run in runs:
+    def ensure(self, period):
+        """Queue the period's missing uncut spectra (every detector)."""
+        rawids = [d[2] for d in self.detectors(period)]
+        for run in self.runs(period):
             _submit(
                 CAL_CHECK_SPECTRA,
                 self._evt_files(period, run),
                 lambda run=run: self._build_spectra(period, run, rawids),
             )
-        if cuts:
-            for run in runs:
-                _submit(
-                    CAL_CHECK_CUTS,
-                    ("cuts", *self._hit_files(period, run)),
-                    lambda run=run: self._build_cuts(period, run, dets),
-                )
 
-    def progress(self, period):
-        """``(uncut ready, section data ready, cal runs)``, errors counting as ready."""
+    def _cuts_key(self, period, run, rawid):
+        return ("cuts", rawid, *self._hit_files(period, run))
+
+    def ensure_cuts(self, period, name):
+        """Queue detector ``name``'s missing section data, every cal run."""
+        dets = [d for d in self.detectors(period) if d[1] == name]
+        for run in self.runs(period) if dets else ():
+            _submit(
+                CAL_CHECK_CUTS,
+                self._cuts_key(period, run, dets[0][2]),
+                lambda run=run: self._build_cuts(period, run, dets),
+            )
+
+    def progress(self, period, name=None):
+        """``(uncut ready, name's section data ready, cal runs)``; errors count as ready."""
         runs = self.runs(period)
         spectra = sum(
             CAL_CHECK_SPECTRA.peek(self._evt_files(period, r)) is not None for r in runs
         )
-        cuts = sum(
-            CAL_CHECK_CUTS.peek(("cuts", *self._hit_files(period, r))) is not None
-            for r in runs
-        )
+        rawid = next((d[2] for d in self.detectors(period) if d[1] == name), None)
+        cuts = 0
+        if rawid is not None:
+            cuts = sum(
+                CAL_CHECK_CUTS.peek(self._cuts_key(period, r, rawid)) is not None
+                for r in runs
+            )
         return spectra, cuts, len(runs)
 
     def section_labels(self, period):
-        """Section names offered for the period (from the first built run)."""
+        """The ``is_valid_cal`` sections, from the first cal run's pars."""
         for run in self.runs(period):
-            data = CAL_CHECK_CUTS.peek(("cuts", *self._hit_files(period, run)))
-            if data and "error" not in data:
-                for det in data.values():
-                    return list(det["sections"])
+            try:
+                pars = self._cal_pars(period, run)
+            except (FileNotFoundError, KeyError, OSError):
+                continue
+            for det in pars.values():
+                ops = det.get("pars", {}).get("operations", {})
+                if CAL_SECTIONS_OF in ops:
+                    return section_names(ops)
         return []
 
-    def spectra(self, period, selected=()):
-        """What the plots draw, from whatever is built so far.
+    def spectra(self, period):
+        """The uncut spectra of every detector, from whatever is built so far.
 
         Returns ``{"runs", "dets", "counts": (n_det, n_run, N_BINS), "ready":
-        (n_det, n_run) bool, "errors": {run: reason}, "missing": {label:
-        sections not applied}}``. With ``selected`` sections the section data
-        is used, else the uncut spectra.
+        (n_det, n_run) bool, "errors": {run: reason}}``.
         """
         runs = self.runs(period)
         dets = self.detectors(period)
         counts = np.zeros((len(dets), len(runs), N_BINS), dtype=np.float32)
         ready = np.zeros((len(dets), len(runs)), dtype=bool)
-        errors, missing = {}, {}
+        errors = {}
         for j, run in enumerate(runs):
-            if selected:
-                data = CAL_CHECK_CUTS.peek(("cuts", *self._hit_files(period, run)))
-            else:
-                data = CAL_CHECK_SPECTRA.peek(self._evt_files(period, run))
+            data = CAL_CHECK_SPECTRA.peek(self._evt_files(period, run))
             if data is None:
                 continue
             if "error" in data:
                 errors[run] = data["error"]
                 continue
-            for i, (label, _name, rid, _string) in enumerate(dets):
+            for i, (_label, _name, rid, _string) in enumerate(dets):
                 entry = data.get(rid)
-                if entry is None:
-                    continue
-                if selected:
-                    counts[i, j], lacking = cut_hist(entry, selected)
-                    if lacking:
-                        missing.setdefault(label, set()).update(lacking)
-                else:
+                if entry is not None:
                     counts[i, j] = entry
-                ready[i, j] = True
+                    ready[i, j] = True
         return {
             "runs": runs,
             "dets": dets,
             "counts": counts,
             "ready": ready,
             "errors": errors,
-            "missing": missing,
         }
+
+    def detector_spectra(self, period, name, selected):
+        """Detector ``name``'s spectrum per cal run with ``selected`` sections.
+
+        Returns ``{"counts": (n_run, N_BINS), "ready": (n_run,) bool,
+        "errors": {run: reason}, "missing": sections not applied}``, from the
+        section data built so far (see :meth:`ensure_cuts`).
+        """
+        runs = self.runs(period)
+        rawid = next((d[2] for d in self.detectors(period) if d[1] == name), None)
+        counts = np.zeros((len(runs), N_BINS), dtype=np.float32)
+        ready = np.zeros(len(runs), dtype=bool)
+        errors, missing = {}, set()
+        for j, run in enumerate(runs if rawid is not None else ()):
+            data = CAL_CHECK_CUTS.peek(self._cuts_key(period, run, rawid))
+            if data is None:
+                continue
+            if "error" in data:
+                errors[run] = data["error"]
+                continue
+            entry = data.get(rawid)
+            if entry is None:
+                errors[run] = "no section data for this detector"
+                continue
+            counts[j], lacking = cut_hist(entry, selected)
+            missing.update(lacking)
+            ready[j] = True
+        return {"counts": counts, "ready": ready, "errors": errors, "missing": missing}
