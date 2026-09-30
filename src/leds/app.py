@@ -14,6 +14,7 @@ import param
 from bokeh.models import FixedTicker
 
 from leds import (
+    calcheck,
     dataset_view,
     event_details,
     sipm_view,
@@ -235,6 +236,8 @@ class EventDisplay(param.Parameterized):
     validation_log_y = param.Boolean(default=True)
     validation_string = param.Selector(default="all strings", objects=["all strings"])
     validation_detector = param.Selector(default=None, objects=[])
+    # calibration check: is_valid_cal sections applied (AND); none = uncut
+    validation_cal_sections = param.ListSelector(default=[], objects=[])
 
     def __init__(self, base_path=None, **params):
         # serialises this session's callbacks; see _serialized. Created first:
@@ -281,6 +284,7 @@ class EventDisplay(param.Parameterized):
 
         self.run_spectrum = RunSpectrum(self.viewer)
         self.validation_data = validation.ValidationData(self.viewer)
+        self.cal_check = calcheck.CalCheck(self._cycle_paths[self.production_cycle])
         self.spectrum_source = spectrum_view.empty_source()
         self.spectrum_pane = pn.pane.Bokeh(
             spectrum_view.make_figure(self.spectrum_source), sizing_mode="stretch_both"
@@ -422,6 +426,15 @@ class EventDisplay(param.Parameterized):
         self.validation_detector_select = pn.widgets.Select.from_param(
             self.param.validation_detector, name="Detector", width=120, visible=False
         )
+        self.validation_sections_select = pn.widgets.CheckBoxGroup.from_param(
+            self.param.validation_cal_sections,
+            name="is_valid_cal sections",
+            inline=True,
+            visible=False,
+            margin=(28, 5, 5, 5),
+        )
+        self._cal_check_poll = None  # periodic refresh while cal data builds
+        self._cal_check_drawn = None  # progress when last drawn
         self.validation_tab = pn.Column(
             pn.Row(
                 pn.widgets.Select.from_param(
@@ -431,6 +444,7 @@ class EventDisplay(param.Parameterized):
                 self.validation_string_select,
                 self.validation_log_toggle,
                 self.validation_detector_select,
+                self.validation_sections_select,
             ),
             self.validation_area,
             sizing_mode="stretch_width",
@@ -689,9 +703,11 @@ class EventDisplay(param.Parameterized):
                 data.period_series(period, bin_seconds)
                 if run:
                     data.load_cal_pars(period, run)
+                cal_check.ensure(period, cuts=False)  # queues its own builds
             except Exception:
                 pass  # the tab reports it when opened
 
+        cal_check = self.cal_check
         _PREFETCH.submit(job)
 
     @param.depends("production_cycle", watch=True)
@@ -701,6 +717,7 @@ class EventDisplay(param.Parameterized):
         self.run_spectrum = RunSpectrum(self.viewer)
         self.processor = WaveformProcessor(self.viewer)
         self.validation_data = validation.ValidationData(self.viewer)
+        self.cal_check = calcheck.CalCheck(self._cycle_paths[self.production_cycle])
         self._cal_cache.clear()
         self._tab_state.clear()
         self._all_wf_figure = AllWaveformsFigure()
@@ -1133,10 +1150,21 @@ class EventDisplay(param.Parameterized):
             return
         plot = self.validation_plot
         is_cal = plot.startswith("calibration")
-        self.validation_bin_select.disabled = is_cal
-        self.validation_log_toggle.disabled = is_cal
-        self.validation_string_select.disabled = is_cal
-        self.validation_detector_select.visible = plot == "calibration detail"
+        binned = (
+            plot in validation_view.RATE_BUILDERS or plot == "qc survival by string"
+        )
+        self.validation_bin_select.disabled = not binned
+        self.validation_log_toggle.disabled = plot not in validation_view.RATE_BUILDERS
+        self.validation_string_select.disabled = (
+            plot not in validation_view.RATE_BUILDERS
+        )
+        self.validation_detector_select.visible = plot in (
+            "calibration detail",
+            "calibration check",
+        )
+        self.validation_sections_select.visible = plot == "calibration check"
+        if plot != "calibration check":
+            self._stop_cal_check_poll()
         if not is_cal:
             self._refresh_validation_strings()
         if self._tab_is_current(TAB_VALIDATION, self._validation_state()):
@@ -1188,10 +1216,36 @@ class EventDisplay(param.Parameterized):
             self.validation_log_y,
             self.validation_string,
             self.validation_detector,
+            tuple(self.validation_cal_sections),
+            self._cal_check_progress(),
         )
 
     def _validation_figure(self, plot):
         """Build the requested validation figure (from cached data)."""
+        if plot == "qc survival by string":
+            times, fracs = self.validation_data.qc_survival_by_string(
+                self.period, validation.BIN_WIDTHS[self.validation_bin_width]
+            )
+            if times.size == 0:
+                msg = f"no event data in period {self.period}"
+                raise _Unavailable(msg)
+            return validation_view.qc_survival_by_string(
+                times, fracs, self.validation_bin_width
+            )
+        if plot == "qc failing flags":
+            counts = self.validation_data.period_qc_flags(self.period)
+            if counts is None:
+                msg = "this cycle's evt tier has no geds/quality/is_not_bb_like"
+                raise _Unavailable(msg)
+            config = self.viewer.paths.get("config")
+            tables = validation.qc_bit_tables(str(config)) if config else {}
+            flags, table = validation.qc_flag_table(counts, tables)
+            rows = self.validation_data.ged_rows(self.period)
+            return validation_view.qc_failing_flags(
+                rows, flags, table, counts, self.period
+            )
+        if plot == "calibration check":
+            return self._cal_check_figure()
         if plot in validation_view.RATE_BUILDERS:
             scope = self.validation_string
             times, rates = self.validation_data.period_series(
@@ -1258,6 +1312,91 @@ class EventDisplay(param.Parameterized):
             self._cal_cache.pop(next(iter(self._cal_cache)))
         return cached
 
+    def _cal_check_progress(self):
+        """Build progress of the calibration check, while it is shown."""
+        if self.validation_plot != "calibration check" or not self.period:
+            return None
+        try:
+            return self.cal_check.progress(self.period)
+        except Exception:  # no cal tier: the figure reports it
+            return None
+
+    def _cal_check_figure(self):
+        """Calibration check of every cal run in the period, from what is built."""
+        period = self.period
+        try:
+            runs = self.cal_check.runs(period)
+        except Exception as exc:
+            msg = f"no cal data for this cycle ({type(exc).__name__}: {exc})"
+            raise _Unavailable(msg) from exc
+        if not runs:
+            msg = f"no cal runs in period {period}"
+            raise _Unavailable(msg)
+        self.cal_check.ensure(period, cuts=True)
+        labels = self.cal_check.section_labels(period)
+        if labels and list(self.param.validation_cal_sections.objects) != labels:
+            self.param.validation_cal_sections.objects = labels
+            kept = [s for s in self.validation_cal_sections if s in labels]
+            self._set_quietly(validation_cal_sections=kept)
+        sections = tuple(self.validation_cal_sections)
+        data = self.cal_check.spectra(period, sections)
+        err, match = calcheck.scale_match(data["counts"].reshape(-1, calcheck.N_BINS))
+        shape = data["ready"].shape
+        names = [d[1] for d in data["dets"]]
+        self.param.validation_detector.objects = names
+        if self.validation_detector not in names:
+            self._set_quietly(validation_detector=names[0] if names else None)
+        progress = self.cal_check.progress(period)
+        layout, source = validation_view.calibration_check(
+            data,
+            err.reshape(shape),
+            match.reshape(shape),
+            self.validation_detector,
+            sections,
+            progress,
+        )
+        source.selected.on_change("indices", self._on_cal_cell)
+        self._cal_check_names = names
+        self._cal_check_source = source
+        uncut, cuts, n = progress
+        if (cuts if sections else uncut) < n:
+            self._start_cal_check_poll()
+        else:
+            self._stop_cal_check_poll()
+        return layout
+
+    def _on_cal_cell(self, _attr, _old, new):
+        self._dispatch(self._select_cal_detector, new)
+
+    @_serialized
+    def _select_cal_detector(self, new):
+        if not new:
+            return
+        det = self._cal_check_source.data["det"][new[0]]
+        self.validation_detector = self._cal_check_names[det]
+
+    def _start_cal_check_poll(self):
+        if self._cal_check_poll is None and pn.state.curdoc is not None:
+            self._cal_check_poll = pn.state.add_periodic_callback(
+                self._poll_cal_check, period=5000
+            )
+
+    def _stop_cal_check_poll(self):
+        if self._cal_check_poll is not None:
+            self._cal_check_poll.stop()
+            self._cal_check_poll = None
+
+    @_serialized
+    def _poll_cal_check(self):
+        """Redraw while cal data builds; the progress is part of the state."""
+        if (
+            self.tabs.active != TAB_VALIDATION
+            or self.validation_plot != "calibration check"
+        ):
+            self._stop_cal_check_poll()
+            return
+        self._guarded("validation", self._update_validation)
+
     def _refresh_validation_strings(self):
         """Offer the period's strings in the scope selector."""
         opts = ["all strings"] + [
@@ -1286,6 +1425,7 @@ class EventDisplay(param.Parameterized):
         "validation_log_y",
         "validation_string",
         "validation_detector",
+        "validation_cal_sections",
         watch=True,
     )
     @_serialized

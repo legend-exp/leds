@@ -111,6 +111,12 @@ class SharedLRU:
                 self._store(key, value)
             return value
 
+    def peek(self, key, default=None):
+        """The cached value for ``key``, or ``default``; never builds one."""
+        with self._lock:
+            value = self._fresh(key)
+        return default if value is _MISS else value
+
     def clear(self):
         with self._lock:
             self._entries.clear()
@@ -167,6 +173,13 @@ VALIDATION_SUMMARIES = SharedLRU(
     name="validation_summaries",
 )
 
+#: Calibration check, per cal run (keyed by the files read): per-detector
+#: uncut 0.5 keV spectra (~1.4 MB), and the is_valid_cal section data (~2 MB:
+#: a histogram of passing hits plus the few failing hits). 32 runs is about
+#: one period. Files are immutable, so no TTL.
+CAL_CHECK_SPECTRA = SharedLRU(32, name="cal_check_spectra")
+CAL_CHECK_CUTS = SharedLRU(32, name="cal_check_cuts")
+
 #: Every cache above, for the warm-up path and for tests.
 ALL = (
     CHANNELMAPS,
@@ -178,6 +191,8 @@ ALL = (
     N_EVENTS,
     RUN_SPECTRA,
     VALIDATION_SUMMARIES,
+    CAL_CHECK_SPECTRA,
+    CAL_CHECK_CUTS,
 )
 
 
