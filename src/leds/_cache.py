@@ -126,19 +126,24 @@ class SharedLRU:
 # The shared caches themselves, in one place so the memory budget is reviewable
 # ---------------------------------------------------------------------------
 
-#: ``(metadata_path, tstamp)`` -> channelmap. The dominant per-session cost:
-#: building one parses the whole metadata checkout and shells out to git.
-#: Entries are ``AttrsDict`` objects marked read-only all the way down, so a
-#: session cannot corrupt another's view of one.
+#: ``(metadata_path, <files valid at the timestamp>)`` -> channelmap, so every
+#: DAQ file of one validity entry shares a build (falls back to the timestamp).
+#: The dominant per-session cost: building one parses the whole metadata
+#: checkout and shells out to git. Entries are ``AttrsDict`` objects marked
+#: read-only all the way down, so a session cannot corrupt another's view.
 CHANNELMAPS = SharedLRU(32, ttl=METADATA_TTL, name="channelmaps")
+
+#: ``(validity_path,)`` -> parsed ``Catalog``, to resolve the files valid at a
+#: timestamp in microseconds (the cache keys above and below).
+CATALOGS = SharedLRU(64, ttl=METADATA_TTL, name="catalogs")
 
 #: ``(metadata_path,)`` -> ``LegendMetadata``. Sharing these also shares their
 #: internal ``TextDB`` file store, so runinfo and groupings are parsed once.
 METADATA = SharedLRU(8, ttl=METADATA_TTL, name="metadata")
 
-#: ``(status_path, start_key, category)`` -> detector statuses. ``TextDB.on``
-#: re-parses ``validity.yaml`` on every call, and the Dataset tab calls it once
-#: per run of the cycle.
+#: ``(status_path, <files valid at start_key>, category)`` -> detector
+#: statuses (falls back to the start key). ``TextDB.on`` re-parses
+#: ``validity.yaml`` on every call, and the Dataset tab calls it once per run.
 STATUSES = SharedLRU(256, ttl=METADATA_TTL, name="statuses")
 
 #: ``(par_root, files)`` -> the calibration part of the ``par_hit``/``par_pht``
@@ -183,6 +188,7 @@ CAL_CHECK_CUTS = SharedLRU(32, name="cal_check_cuts")
 #: Every cache above, for the warm-up path and for tests.
 ALL = (
     CHANNELMAPS,
+    CATALOGS,
     METADATA,
     STATUSES,
     CAL_PARS,

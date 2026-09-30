@@ -7,10 +7,12 @@ from pathlib import Path
 import h5py
 import lh5
 import numpy as np
+from dbetto.catalog import Catalog
 from legendmeta import LegendMetadata
 from packaging.version import Version
 
 from leds._cache import (
+    CATALOGS,
     CHANNELMAPS,
     METADATA,
     N_EVENTS,
@@ -19,6 +21,27 @@ from leds._cache import (
     STATUSES,
 )
 from leds.config import load_paths
+
+VALIDITY_FILES = ("validity.yaml", "validity.jsonl")
+
+
+def _valid_files(db, tstamp, category="all"):
+    """The files ``db.on(tstamp, category=category)`` would merge, as a tuple.
+
+    Serves as a cache key: every timestamp of one validity entry gets the same
+    one. ``None`` when that cannot be worked out, so callers key by the
+    timestamp instead -- slower, never wrong.
+    """
+    try:
+        root = Path(db.__path__)
+        found = [root / f for f in VALIDITY_FILES if (root / f).is_file()]
+        if len(found) != 1:
+            return None
+        validity = str(found[0])
+        catalog = CATALOGS.get((validity,), lambda: Catalog.read_from(validity))
+        return tuple(str(f) for f in catalog.valid_for(tstamp, category))
+    except Exception:  # unexpected layout: fall back to the timestamp
+        return None
 
 
 def _tstamp_to_unix(tstamp):
@@ -518,7 +541,8 @@ class EventViewer:
         is the accessor those should use rather than reaching into
         ``status_db.statuses`` themselves.
         """
-        key = (str(self.paths.detector_status), start_key, category)
+        files = _valid_files(self.status_db.statuses, start_key, category or "all")
+        key = (str(self.paths.detector_status), files or start_key, category)
         if category is None:
             return STATUSES.get(key, lambda: self.status_db.statuses.on(start_key))
         return STATUSES.get(
@@ -561,9 +585,24 @@ class EventViewer:
         every detector YAML in the checkout. The result is a deep copy marked
         read-only all the way down, so sharing it cannot let one session
         corrupt another's view.
+
+        Keyed by the files valid at ``tstamp`` in every db the build reads
+        (``dataprod.config`` only matters for pre-v0.5.9 metadata), so all
+        DAQ files of one validity entry share one build.
         """
+        meta = self.meta
+        try:
+            dbs = (
+                meta.hardware.configuration.channelmaps,
+                meta.datasets.statuses,
+                meta.dataprod.config,
+            )
+        except Exception:  # an unusual checkout: key by the timestamp
+            dbs = ()
+        files = [_valid_files(db, tstamp) for db in dbs]
+        key = tuple(files) if files and None not in files else tstamp
         return CHANNELMAPS.get(
-            (str(self.paths.metadata), tstamp),
+            (str(self.paths.metadata), key),
             lambda: self.meta.channelmap(
                 tstamp, skip_version_check=self._skip_git_version_check()
             ),
