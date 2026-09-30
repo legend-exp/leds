@@ -252,6 +252,14 @@ class FakeLGDO:
         return self.value
 
 
+def qc_data(monkeypatch, raw, tables):
+    """A ValidationData whose QC flag reduction reads ``raw``."""
+    monkeypatch.setattr(validation_mod, "_read_groups", lambda *_a, **_k: raw)
+    data = ValidationData(FakeViewer(runs={"p01": {"r001": ["ts"]}}))
+    data._qc_tables = lambda: tables  # type: ignore[method-assign]
+    return data
+
+
 def test_qc_flag_counts_and_names(monkeypatch):
     nbb = "geds/quality/is_not_bb_like"
     raw = {
@@ -266,24 +274,51 @@ def test_qc_flag_counts_and_names(monkeypatch):
             ak.Array([[np.nan, np.nan], [np.nan], [np.nan]])
         ),
     }
-    monkeypatch.setattr(validation_mod, "_read_groups", lambda *_a, **_k: raw)
-    data = ValidationData(FakeViewer(runs={"p01": {"r001": ["ts"]}}))
+    data = qc_data(monkeypatch, raw, {"is_empty_bits": ["flag_a", "flag_b"]})
 
     counts, progress = data.period_qc_flags("p01")
 
     assert progress == (1, 1, [])
-
     assert counts["events"] == 2  # the forced event is left out
     assert counts["failing"] == {101: 2, 201: 1}
     assert counts["discharge"] == 1
-    assert set(counts["bits"]) == {"is_empty_bits"}  # the NaN class is left out
-    flags, table = qc_flag_table(counts, {"is_empty_bits": ["flag_a", "flag_b"]})
+    flags, table = qc_flag_table(counts)
     assert flags == ["flag_a", "flag_b"]
     assert table[101] == {"flag_a": 1, "flag_b": 1}
     assert table[201] == {"flag_a": 1, "flag_b": 1}
+
     # a table narrower than the stored bits gets numbered labels instead
-    flags, _ = qc_flag_table(counts, {"is_empty_bits": ["only_one"]})
+    validation_mod.VALIDATION_SUMMARIES.clear()
+    data = qc_data(monkeypatch, raw, {"is_empty_bits": ["only_one"]})
+    flags, _ = qc_flag_table(data.period_qc_flags("p01")[0])
     assert flags == ["is_empty bit 0", "is_empty bit 1"]
+
+
+def test_qc_reasons_come_from_the_closest_class(monkeypatch):
+    """A positive pulse failing tail_rms is not blamed on trap_tpmin.
+
+    trap_tpmin only belongs to the negative-polarity class, so it is unset on
+    nearly every positive pulse; counting it would make it the "reason" for
+    almost every failing hit.
+    """
+    nbb = "geds/quality/is_not_bb_like"
+    tables = {
+        "is_neg_polarity_bits": ["bl_slope", "tail_rms", "trap_tpmin"],
+        "is_pos_polarity_bits": ["bl_slope", "tail_rms", "trap_tpmax"],
+    }
+    raw = {
+        "trigger/is_forced": FakeLGDO([False, False]),
+        "coincident/puls": FakeLGDO([False, False]),
+        f"{nbb}/rawid": FakeLGDO(ak.Array([[101], [101]])),
+        # hit 0: a positive pulse with a bad tail; hit 1: a bad baseline
+        f"{nbb}/is_pos_polarity_bits": FakeLGDO(ak.Array([[0b101], [0b110]])),
+        f"{nbb}/is_neg_polarity_bits": FakeLGDO(ak.Array([[0b001], [0b010]])),
+    }
+    data = qc_data(monkeypatch, raw, tables)
+
+    counts, _ = data.period_qc_flags("p01")
+
+    assert counts["reasons"][101] == {"tail_rms": 1, "bl_slope": 1}
 
 
 def test_light_summaries_match_the_full_ones():
@@ -337,6 +372,26 @@ def test_period_series_so_far_fills_in_without_waiting():
     ref_times, ref_rates = data.period_series("p01", 3600, keys=keys)
     np.testing.assert_array_equal(times, ref_times)
     np.testing.assert_array_equal(rates[keys[0]], ref_rates[keys[0]])
+
+
+def test_top_failures_ranks_detectors_and_names_the_leading_flag():
+    counts = {
+        "events": 1000,
+        "failing": {101: 10, 201: 4, 301: 25, 401: 1},
+        "flags": ["flag_a", "flag_b"],
+        # of 101's 10 failing hits: flag_a caused 3, flag_b 8 (some both)
+        "reasons": {101: {"flag_a": 3, "flag_b": 8}, 201: {"flag_a": 4, "flag_b": 1}},
+    }
+
+    top = validation_mod.top_failures(counts, n=3)
+
+    assert [t[0] for t in top] == [301, 101, 201]  # most failing hits first
+    assert top[0][3] is None  # its bitmasks say nothing about why
+    rid, failing, frac, lead, share = top[1]
+    assert (rid, failing, lead) == (101, 10, "flag_b")
+    assert frac == pytest.approx(0.01)
+    assert share == pytest.approx(0.8)
+    assert top[2][3] == "flag_a"
 
 
 def test_period_series_rejects_bad_bin_seconds():

@@ -1298,13 +1298,31 @@ class EventDisplay(param.Parameterized):
                         "runs done; the plot appears as they finish"
                     )
                 raise _Unavailable(msg)
-            config = self.viewer.paths.get("config")
-            tables = validation.qc_bit_tables(str(config)) if config else {}
-            flags, table = validation.qc_flag_table(counts, tables)
+            flags, table = validation.qc_flag_table(counts)
             rows = self.validation_data.ged_rows(self.period)
             fig = validation_view.qc_failing_flags(
                 rows, flags, table, counts, self.period
             )
+            return _note_progress(fig, progress)
+        if plot == "qc failures by run":
+            per_run, progress = self.validation_data.run_qc_flags(
+                self.period, wait=not self._progressive
+            )
+            built, runs, _errors = progress
+            self._validation_building = built < runs
+            if not per_run:
+                msg = "this cycle's evt tier has no geds/quality/is_not_bb_like"
+                if built < runs:
+                    msg = (
+                        f"reading the QC flags of {self.period}: {built} of {runs} "
+                        "runs done; the plot appears as they finish"
+                    )
+                raise _Unavailable(msg)
+            names = {
+                rid: label for label, rid in self.validation_data.ged_rows(self.period)
+            }
+            top = [(run, validation.top_failures(c)) for run, c in per_run]
+            fig = validation_view.qc_failures_by_run(top, names, self.period)
             return _note_progress(fig, progress)
         if plot == "calibration check":
             return self._cal_check_figure()
@@ -1413,7 +1431,7 @@ class EventDisplay(param.Parameterized):
                     string = -1  # any string: needs the full summaries
                 keys = None if plot == "qc survival by string" else _plot_keys(plot)
                 return self.validation_data.summaries_ready(period, string, keys)
-            if plot == "qc failing flags":
+            if plot in ("qc failing flags", "qc failures by run"):
                 return self.validation_data.qc_flags_ready(period)
             if plot == "calibration check":
                 name = (
@@ -1438,7 +1456,7 @@ class EventDisplay(param.Parameterized):
                 return f"section data for {self.validation_detector}", cuts, n
             return None
         built, runs = progress
-        what = "QC flags" if plot == "qc failing flags" else "runs"
+        what = "QC flags" if plot.startswith("qc fail") else "runs"
         return f"reading the {what} of {self.period}", built, runs
 
     def _update_progress_bar(self):
