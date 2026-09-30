@@ -10,7 +10,9 @@ def th_spectrum(scale=1.0, n=60_000, seed=0):
     """A Th-228-like spectrum on the stored bins: lines on a falling continuum."""
     rng = np.random.default_rng(seed)
     e = [rng.exponential(600.0, n)]
-    for line, frac in zip(C.TH_LINES, (0.2, 0.08, 0.02, 0.02, 0.01, 0.015, 0.05), strict=True):
+    for line, frac in zip(
+        C.TH_LINES, (0.2, 0.08, 0.02, 0.02, 0.01, 0.015, 0.05), strict=True
+    ):
         e.append(rng.normal(line, 1.2, int(frac * n)))
     h, _ = np.histogram(np.concatenate(e) * scale, bins=C.N_BINS, range=(0, C.E_MAX))
     return h.astype(float)
@@ -18,7 +20,9 @@ def th_spectrum(scale=1.0, n=60_000, seed=0):
 
 def test_scale_match_finds_gain_and_misidentified_peaks():
     good = [th_spectrum(seed=s) for s in range(5)]
-    spectra = np.array([*good, th_spectrum(1.003, seed=9), th_spectrum(2614.511 / 2103.511, seed=8)])
+    spectra = np.array(
+        [*good, th_spectrum(1.003, seed=9), th_spectrum(2614.511 / 2103.511, seed=8)]
+    )
 
     err, match = C.scale_match(spectra)
 
@@ -38,9 +42,14 @@ def test_scale_match_leaves_thin_spectra_out():
 
 def test_sections_and_their_evaluation():
     ops = {
-        "is_valid_cal": {"expression": "is_valid_baseline & (is_valid_dteff_cal) & bl_pileup_cut"},
+        "is_valid_cal": {
+            "expression": "is_valid_baseline & (is_valid_dteff_cal) & bl_pileup_cut"
+        },
         "is_valid_baseline": {"expression": "is_valid_bl_slope & is_valid_bl_poly_rms"},
-        "is_valid_dteff_cal": {"expression": "(dt_eff < a) | is_low_cuspEmax", "parameters": {"a": 5.0}},
+        "is_valid_dteff_cal": {
+            "expression": "(dt_eff < a) | is_low_cuspEmax",
+            "parameters": {"a": 5.0},
+        },
     }
     cols = {
         "is_valid_bl_slope": np.array([1, 1, 0, 1], bool),
@@ -51,9 +60,16 @@ def test_sections_and_their_evaluation():
     }
     sections = C.section_names(ops)
     assert sections == ["is_valid_baseline", "is_valid_dteff_cal", "bl_pileup_cut"]
-    assert C.needed_fields("is_valid_dteff_cal", ops, set(cols)) == {"dt_eff", "is_low_cuspEmax"}
-    np.testing.assert_array_equal(C.evaluate("is_valid_baseline", ops, cols), [1, 0, 0, 1])
-    np.testing.assert_array_equal(C.evaluate("is_valid_dteff_cal", ops, cols), [1, 1, 1, 0])
+    assert C.needed_fields("is_valid_dteff_cal", ops, set(cols)) == {
+        "dt_eff",
+        "is_low_cuspEmax",
+    }
+    np.testing.assert_array_equal(
+        C.evaluate("is_valid_baseline", ops, cols), [1, 0, 0, 1]
+    )
+    np.testing.assert_array_equal(
+        C.evaluate("is_valid_dteff_cal", ops, cols), [1, 1, 1, 0]
+    )
     with pytest.raises(KeyError):
         C.needed_fields("is_valid_tail", ops, set(cols))
 
@@ -66,11 +82,18 @@ def test_cut_hist_matches_direct_masking():
     det = {
         "sections": ["a", "b", "c"],
         "missing": set(),
-        "pass": np.histogram(e[masks == full], C.N_BINS, (0, C.E_MAX))[0].astype(np.float32),
+        "pass": np.histogram(e[masks == full], C.N_BINS, (0, C.E_MAX))[0].astype(
+            np.float32
+        ),
         "fail_e": e[masks != full],
         "fail_mask": masks[masks != full],
     }
-    for selected, bits in ([], 0), (["a"], 0b001), (["a", "c"], 0b101), (["a", "b", "c"], full):
+    for selected, bits in (
+        ([], 0),
+        (["a"], 0b001),
+        (["a", "c"], 0b101),
+        (["a", "b", "c"], full),
+    ):
         direct, _ = np.histogram(e[(masks & bits) == bits], C.N_BINS, (0, C.E_MAX))
         mine, missing = C.cut_hist(det, selected)
         np.testing.assert_array_equal(mine, direct)

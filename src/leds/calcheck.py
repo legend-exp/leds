@@ -150,7 +150,9 @@ def profiles(spectra):
     centers = (np.arange(N_BINS) + 0.5) * BIN
     grid = np.exp(LOG_E)
     y = np.log1p(np.array([np.interp(grid, centers, s) for s in spectra]))
-    csum = np.cumsum(np.pad(y, ((0, 0), (SMOOTH // 2, SMOOTH - SMOOTH // 2)), mode="edge"), axis=1)
+    csum = np.cumsum(
+        np.pad(y, ((0, 0), (SMOOTH // 2, SMOOTH - SMOOTH // 2)), mode="edge"), axis=1
+    )
     base = (csum[:, SMOOTH:] - csum[:, :-SMOOTH]) / SMOOTH
     p = np.clip(y - base[:, : y.shape[1]], 0, None)
     p -= p.mean(axis=1, keepdims=True)
@@ -190,7 +192,9 @@ def scale_match(spectra, reference=None):
     b = window[rows, k]
     c = window[rows, np.minimum(k + 1, window.shape[1] - 1)]
     denom = a - 2 * b + c
-    sub = np.where(inner & (denom != 0), 0.5 * (a - c) / np.where(denom == 0, 1, denom), 0)
+    sub = np.where(
+        inner & (denom != 0), 0.5 * (a - c) / np.where(denom == 0, 1, denom), 0
+    )
     err[enough] = (np.exp((k - lag + sub) * du) - 1) * 100
     match[enough] = b
     return err, match
@@ -259,8 +263,12 @@ class CalCheck:
             key=lambda d: (int(d.location.string), int(d.location.position)),
         )
         return [
-            (f"s{int(d.location.string):02d} {d.name}", d.name, int(d.daq.rawid),
-             int(d.location.string))
+            (
+                f"s{int(d.location.string):02d} {d.name}",
+                d.name,
+                int(d.daq.rawid),
+                int(d.location.string),
+            )
             for d in dets
         ]
 
@@ -375,7 +383,9 @@ class CalCheck:
     def progress(self, period):
         """``(uncut ready, section data ready, cal runs)``, errors counting as ready."""
         runs = self.runs(period)
-        spectra = sum(CAL_CHECK_SPECTRA.peek(self._evt_files(period, r)) is not None for r in runs)
+        spectra = sum(
+            CAL_CHECK_SPECTRA.peek(self._evt_files(period, r)) is not None for r in runs
+        )
         cuts = sum(
             CAL_CHECK_CUTS.peek(("cuts", *self._hit_files(period, r))) is not None
             for r in runs
