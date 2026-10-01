@@ -175,12 +175,21 @@ def build_header_links():
     )
 
 
-def _plot_keys(plot="trigger rates"):
+#: Plots the Events switch (physics / forced / all) applies to.
+QC_PLOTS = (
+    "qc survival",
+    "qc survival by string",
+    "qc failing flags",
+    "qc failures by run",
+)
+
+
+def _plot_keys(plot="trigger rates", events="physics"):
     """The rate series a rate plot draws (light ones need less reading)."""
     groups = {
         "trigger rates": ("trigger",),
         "multiplicity rates": ("multiplicity",),
-        "qc survival": ("qc",),
+        "qc survival": (validation.QC_EVENTS[events][0],),
         "K-line rates": tuple(validation.K_LINES),
     }[plot]
     return [(g, label) for g in groups for label in validation.RATE_GROUPS[g]]
@@ -263,6 +272,15 @@ class EventDisplay(param.Parameterized):
     validation_detector = param.Selector(default=None, objects=[])
     # calibration check: is_valid_cal sections applied (AND); none = uncut
     validation_cal_sections = param.ListSelector(default=[], objects=[])
+    # QC plots: which events (see validation.QC_EVENTS)
+    validation_qc_events = param.Selector(
+        default="physics",
+        objects={
+            "physics": "physics",
+            "forced, no pulser": "forced",
+            "all events": "all",
+        },
+    )
 
     def __init__(self, base_path=None, **params):
         # serialises this session's callbacks; see _serialized. Created first:
@@ -454,6 +472,12 @@ class EventDisplay(param.Parameterized):
         self.validation_detector_select = pn.widgets.Select.from_param(
             self.param.validation_detector, name="Detector", width=120, visible=False
         )
+        self.validation_events_select = pn.widgets.RadioButtonGroup.from_param(
+            self.param.validation_qc_events,
+            name="Events",
+            visible=False,
+            margin=(28, 5, 5, 5),
+        )
         # calibration check: is_valid_cal sections for the drill-down spectra
         self.validation_sections_select = pn.widgets.CheckBoxGroup.from_param(
             self.param.validation_cal_sections,
@@ -493,6 +517,7 @@ class EventDisplay(param.Parameterized):
                 self.validation_string_select,
                 self.validation_log_toggle,
                 self.validation_detector_select,
+                self.validation_events_select,
             ),
             self.validation_sections_row,
             self.validation_progress_row,
@@ -1212,6 +1237,7 @@ class EventDisplay(param.Parameterized):
             "calibration check",
         )
         self.validation_sections_row.visible = plot == "calibration check"
+        self.validation_events_select.visible = plot in QC_PLOTS
         if not is_cal:
             self._refresh_validation_strings()
         if self._tab_is_current(TAB_VALIDATION, self._validation_state()):
@@ -1268,6 +1294,7 @@ class EventDisplay(param.Parameterized):
             self.validation_string,
             self.validation_detector,
             tuple(self.validation_cal_sections),
+            self.validation_qc_events,
             self._validation_progress(),
         )
 
@@ -1278,15 +1305,18 @@ class EventDisplay(param.Parameterized):
                 self.period,
                 validation.BIN_WIDTHS[self.validation_bin_width],
                 wait=not self._progressive,
+                events=self.validation_qc_events,
             )
             self._check_built(times, progress)
             fig = validation_view.qc_survival_by_string(
-                times, fracs, self.validation_bin_width
+                times, fracs, self.validation_bin_width, self.validation_qc_events
             )
             return _note_progress(fig, progress)
         if plot == "qc failing flags":
             counts, progress = self.validation_data.period_qc_flags(
-                self.period, wait=not self._progressive
+                self.period,
+                wait=not self._progressive,
+                events=self.validation_qc_events,
             )
             built, runs, _errors = progress
             self._validation_building = built < runs
@@ -1301,12 +1331,14 @@ class EventDisplay(param.Parameterized):
             flags, table = validation.qc_flag_table(counts)
             rows = self.validation_data.ged_rows(self.period)
             fig = validation_view.qc_failing_flags(
-                rows, flags, table, counts, self.period
+                rows, flags, table, counts, self.period, self.validation_qc_events
             )
             return _note_progress(fig, progress)
         if plot == "qc failures by run":
             per_run, progress = self.validation_data.run_qc_flags(
-                self.period, wait=not self._progressive
+                self.period,
+                wait=not self._progressive,
+                events=self.validation_qc_events,
             )
             built, runs, _errors = progress
             self._validation_building = built < runs
@@ -1322,7 +1354,9 @@ class EventDisplay(param.Parameterized):
                 rid: label for label, rid in self.validation_data.ged_rows(self.period)
             }
             top = [(run, validation.top_failures(c)) for run, c in per_run]
-            fig = validation_view.qc_failures_by_run(top, names, self.period)
+            fig = validation_view.qc_failures_by_run(
+                top, names, self.period, events=self.validation_qc_events
+            )
             return _note_progress(fig, progress)
         if plot == "calibration check":
             return self._cal_check_figure()
@@ -1332,7 +1366,7 @@ class EventDisplay(param.Parameterized):
                 self.period,
                 validation.BIN_WIDTHS[self.validation_bin_width],
                 None if scope == "all strings" else int(scope),
-                _plot_keys(plot),
+                _plot_keys(plot, self.validation_qc_events),
             )
             if self._progressive:
                 times, rates, progress = self.validation_data.period_series_so_far(
@@ -1342,12 +1376,16 @@ class EventDisplay(param.Parameterized):
                 times, rates = self.validation_data.period_series(*args)
                 progress = None
             self._check_built(times, progress)
+            extra = (
+                {"events": self.validation_qc_events} if plot == "qc survival" else {}
+            )
             fig = validation_view.RATE_BUILDERS[plot](
                 times,
                 rates,
                 self.validation_bin_width,
                 log_y=self.validation_log_y,
                 scope=scope if scope == "all strings" else f"string {scope}",
+                **extra,
             )
             return _note_progress(fig, progress)
 
@@ -1429,7 +1467,9 @@ class EventDisplay(param.Parameterized):
                     or self.validation_string != "all strings"
                 ):
                     string = -1  # any string: needs the full summaries
-                keys = None if plot == "qc survival by string" else _plot_keys(plot)
+                keys = None
+                if plot != "qc survival by string":
+                    keys = _plot_keys(plot, self.validation_qc_events)
                 return self.validation_data.summaries_ready(period, string, keys)
             if plot in ("qc failing flags", "qc failures by run"):
                 return self.validation_data.qc_flags_ready(period)
@@ -1600,6 +1640,7 @@ class EventDisplay(param.Parameterized):
         "validation_string",
         "validation_detector",
         "validation_cal_sections",
+        "validation_qc_events",
         watch=True,
     )
     @_serialized

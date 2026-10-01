@@ -88,7 +88,16 @@ LIGHT_FIELDS = {
 }
 LIGHT_NESTED = ("geds/quality/is_bb_like",)
 #: Series groups a light summary holds.
-LIGHT_GROUPS = ("trigger", "multiplicity", "qc")
+LIGHT_GROUPS = ("trigger", "multiplicity", "qc", "qc_forced", "qc_all")
+
+#: Events the QC plots can be drawn for: key -> (rate group, title words).
+#: Physics excludes forced triggers and pulser events; forced keeps the
+#: forced triggers (baselines) without the pulser.
+QC_EVENTS = {
+    "physics": ("qc", "physics events (forced/pulser removed)"),
+    "forced": ("qc_forced", "forced-trigger events (pulser removed)"),
+    "all": ("qc_all", "all events"),
+}
 
 #: Read only for the failing-flags plot, in their own pass, so the rate
 #: summaries do not pay for them: the physics-event flags, and per
@@ -152,6 +161,8 @@ RATE_GROUPS = {
     "trigger": ("all triggers", "forced", "pulser", "muon", "muon offline"),
     "multiplicity": ("m = 0", "m = 1", "m = 2", "m > 2"),
     "qc": ("pass", "fail"),
+    "qc_forced": ("pass", "fail"),
+    "qc_all": ("pass", "fail"),
 }
 KLINE_CONFIGS = ("before cuts", "after QC", "after mult = 1", "after LAr", "after PSD")
 RATE_GROUPS |= dict.fromkeys(K_LINES, KLINE_CONFIGS)
@@ -163,6 +174,8 @@ GROUP_UNIT_SECONDS = {
     "trigger": 1,
     "multiplicity": 1,
     "qc": 1,
+    "qc_forced": 1,
+    "qc_all": 1,
     **dict.fromkeys(K_LINES, 3600),
 }
 GROUP_UNIT_LABEL = {1: "rate (Hz / kg)", 3600: "rate (counts / hour / kg)"}
@@ -312,6 +325,24 @@ def _qc_reasons(raw, keep, n_hits, inverse, ids, tables):
     return sorted(order, key=order.get), reasons
 
 
+def _qc_reduce(raw, rawid, keep, tables):
+    """QC flag counts of the events ``keep`` (see ``_qc_flag_counts``)."""
+    rid = ak.to_numpy(ak.flatten(rawid[keep])).astype(np.int64)
+    ids, inverse, n_fail = np.unique(rid, return_inverse=True, return_counts=True)
+    flags, reasons = _qc_reasons(raw, keep, rid.size, inverse, ids, tables)
+    out = {
+        "events": int(keep.sum()),
+        "failing": dict(zip(ids.tolist(), n_fail.tolist(), strict=True)),
+        "flags": flags,
+        "reasons": reasons,
+        "discharge": None,
+    }
+    dd = raw.get("geds/quality/is_not_bb_like/is_delayed_discharge")
+    if dd is not None:
+        out["discharge"] = int((dd.nda.astype(bool) & keep).sum())
+    return out
+
+
 def qc_flag_table(counts):
     """``(flags, {rawid: {flag: failing hits it caused}})`` of QC flag counts."""
     return counts["flags"], counts["reasons"]
@@ -320,8 +351,9 @@ def qc_flag_table(counts):
 def top_failures(counts, n=10):
     """The ``n`` detectors of one run failing QC most, each with its leading flag.
 
-    Ranked by QC-failing hits per physics event. Returns ``[(rawid, failing
-    hits, fraction of physics events, leading flag, share of the detector's
+    Ranked by QC-failing hits per event of the counts' selection (see
+    ``QC_EVENTS``). Returns ``[(rawid, failing hits, fraction of those
+    events, leading flag, share of the detector's
     failing hits it caused)]``; the flag is ``None`` when the bitmasks carry
     no information. See :func:`_qc_reasons` for what counts as a cause.
     """
@@ -421,9 +453,14 @@ class ValidationData:
             ("trigger", "pulser"): d["puls"],
             ("trigger", "muon"): d["muon"],
             ("trigger", "muon offline"): d["muon_offline"],
-            ("qc", "pass"): _both(phys, d["qc"]),
-            ("qc", "fail"): _both(phys, _not(d["qc"])),
         }
+        for group, events in (
+            ("qc", phys),
+            ("qc_forced", _both(d["forced"], _not(d["puls"]))),
+            ("qc_all", np.ones(len(d["timestamp"]), dtype=bool)),
+        ):
+            masks[(group, "pass")] = _both(events, d["qc"])
+            masks[(group, "fail")] = _both(events, _not(d["qc"]))
         for label, sel in MULT_SELECTIONS.items():
             cond = None if d["mult"] is None else sel(d["mult"])
             masks[("multiplicity", label)] = _both(phys, cond)
@@ -547,19 +584,20 @@ class ValidationData:
 
     def _qc_flag_key(self, period, run):
         files = tuple(map(str, self.viewer._run_files(period, run)))
-        return ("qc_reasons", self.viewer.cycle_key, period, run, files)
+        return ("qc_reasons_by_events", self.viewer.cycle_key, period, run, files)
 
     def _qc_tables(self):
         config = getattr(self.viewer, "paths", {}).get("config")
         return qc_bit_tables(str(config)) if config else {}
 
     def _qc_flag_counts(self, period, run, wait=True):
-        """Per detector, why its hits fail QC, over physics events.
+        """Per detector, why its hits fail QC, for each of ``QC_EVENTS``.
 
-        Returns ``{"events": physics events, "failing": {rawid: failing hits},
-        "flags": [flag names], "reasons": {rawid: {flag: failing hits it
-        caused}}, "discharge": delayed-discharge events}``, or ``None``
-        without the ``is_not_bb_like`` fields. See :func:`_qc_reasons` for
+        Returns ``{events: {"events": selected events, "failing": {rawid:
+        failing hits}, "flags": [flag names], "reasons": {rawid: {flag:
+        failing hits it caused}}, "discharge": delayed-discharge events}}``,
+        or ``None`` without the ``is_not_bb_like`` fields. One read serves
+        every selection. See :func:`_qc_reasons` for
         how a failing hit's reasons are chosen. A pass of its own over the files, cached like
         :meth:`_summary`, so the rate plots never read these fields. With
         ``wait=False``, ``_NOT_BUILT`` until built (queued in the background).
@@ -573,26 +611,21 @@ class ValidationData:
             if raw.get(f"{nbb}/rawid") is None:
                 return None
             rawid = raw[f"{nbb}/rawid"].view_as("ak")
+            n = len(rawid)
             forced, puls = raw.get("trigger/is_forced"), raw.get("coincident/puls")
-            keep = np.ones(len(rawid), dtype=bool)
-            if forced is not None and puls is not None:
-                keep = ~(forced.nda.astype(bool) | puls.nda.astype(bool))
-            rid = ak.to_numpy(ak.flatten(rawid[keep])).astype(np.int64)
-            ids, inverse, n_fail = np.unique(
-                rid, return_inverse=True, return_counts=True
-            )
-            flags, reasons = _qc_reasons(raw, keep, rid.size, inverse, ids, tables)
-            out = {
-                "events": int(keep.sum()),
-                "failing": dict(zip(ids.tolist(), n_fail.tolist(), strict=True)),
-                "flags": flags,
-                "reasons": reasons,
-                "discharge": None,
+            if forced is None or puls is None:
+                forced = puls = np.zeros(n, dtype=bool)  # every event counts
+            else:
+                forced, puls = forced.nda.astype(bool), puls.nda.astype(bool)
+            selections = {
+                "physics": ~(forced | puls),
+                "forced": forced & ~puls,
+                "all": np.ones(n, dtype=bool),
             }
-            dd = raw.get(f"{nbb}/is_delayed_discharge")
-            if dd is not None:
-                out["discharge"] = int((dd.nda.astype(bool) & keep).sum())
-            return out
+            return {
+                events: _qc_reduce(raw, rawid, keep, tables)
+                for events, keep in selections.items()
+            }
 
         key = self._qc_flag_key(period, run)
         if wait:
@@ -612,11 +645,12 @@ class ValidationData:
         )
         return built, len(runs)
 
-    def run_qc_flags(self, period, wait=True):
+    def run_qc_flags(self, period, wait=True, events="physics"):
         """``([(run, counts)], (built, runs, errors))``: per-run QC flag counts.
 
-        ``counts`` as :meth:`_qc_flag_counts`; runs without the fields are left
-        out. With ``wait=False`` only the runs built so far; the rest queued.
+        ``counts`` as one ``events`` entry of :meth:`_qc_flag_counts`; runs
+        without the fields are left out. With ``wait=False`` only the runs
+        built so far; the rest queued.
         """
         per_run, built, errors = [], 0, []
         runs = sorted(self.viewer.available_runs().get(period, {}))
@@ -628,15 +662,15 @@ class ValidationData:
             if isinstance(part, dict) and "error" in part:
                 errors.append(f"{run}: {part['error']}")
             elif part is not None:
-                per_run.append((run, part))
+                per_run.append((run, part[events]))
         return per_run, (built, len(runs), errors)
 
-    def period_qc_flags(self, period, wait=True):
+    def period_qc_flags(self, period, wait=True, events="physics"):
         """:meth:`_qc_flag_counts` summed over every run of ``period``.
 
         Returns ``(counts, (built, runs, errors))``, see :meth:`run_qc_flags`.
         """
-        per_run, progress = self.run_qc_flags(period, wait)
+        per_run, progress = self.run_qc_flags(period, wait, events)
         total = None
         for _run, part in per_run:
             if total is None:
@@ -882,14 +916,15 @@ class ValidationData:
             ]
         return []
 
-    def qc_survival_by_string(self, period, bin_seconds, wait=True):
+    def qc_survival_by_string(self, period, bin_seconds, wait=True, events="physics"):
         """``(times_ms, {string: survival fraction}, progress)`` over ``period``.
 
         With ``wait=False`` only the runs built so far are used (see
         :meth:`period_series_so_far`); ``progress`` is then its
         ``(built, runs, errors)``, else ``None``.
         """
-        keys = [("qc", "pass"), ("qc", "fail")]
+        group = QC_EVENTS[events][0]
+        keys = [(group, "pass"), (group, "fail")]
         times, fracs, progress = np.array([]), {}, None
         for string in self.available_strings(period):
             if wait:
