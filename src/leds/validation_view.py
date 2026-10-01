@@ -38,6 +38,7 @@ from leds.validation import (
     GROUP_UNIT_LABEL,
     GROUP_UNIT_SECONDS,
     K_LINES,
+    QC_EVENTS,
     RATE_GROUPS,
     survival_fraction,
 )
@@ -146,13 +147,16 @@ def multiplicity_rates(times_ms, rates, bin_label, log_y=True, scope="all string
     )
 
 
-def qc_survival(times_ms, rates, bin_label, log_y=False, scope="all strings"):
-    """Fraction of physics events passing the quality cuts, per time bin.
+def qc_survival(
+    times_ms, rates, bin_label, log_y=False, scope="all strings", events="physics"
+):
+    """Fraction of ``events`` (see ``QC_EVENTS``) passing the quality cuts, per bin.
 
     A ratio of two same-scope rates, so the mass normalisation cancels; the
     string restriction still applies through the underlying series.
     """
-    frac = survival_fraction(rates.get(("qc", "pass")), rates.get(("qc", "fail")))
+    group, words = QC_EVENTS[events]
+    frac = survival_fraction(rates.get((group, "pass")), rates.get((group, "fail")))
     fig = figure(
         x_axis_type="datetime",
         y_axis_type="log" if log_y else "linear",
@@ -160,8 +164,7 @@ def qc_survival(times_ms, rates, bin_label, log_y=False, scope="all strings"):
         sizing_mode="stretch_width",
         tools="pan,box_zoom,wheel_zoom,reset,save",
         toolbar_location="right",
-        title=f"quality-cut survival fraction, forced/pulser removed "
-        f"({bin_label} bins, {scope})",
+        title=f"quality-cut survival fraction of {words} ({bin_label} bins, {scope})",
         # a fixed 0..1 range only makes sense on a linear axis
         **({} if log_y else {"y_range": (0.0, 1.05)}),
     )
@@ -201,7 +204,7 @@ def kline_rates(times_ms, rates, bin_label, log_y=True, scope="all strings"):
     return column(*figs, sizing_mode="stretch_width")
 
 
-def qc_survival_by_string(times_ms, fracs, bin_label):
+def qc_survival_by_string(times_ms, fracs, bin_label, events="physics"):
     """Quality-cut survival fraction, one line per string on one figure."""
     fig = figure(
         x_axis_type="datetime",
@@ -209,7 +212,7 @@ def qc_survival_by_string(times_ms, fracs, bin_label):
         sizing_mode="stretch_width",
         tools="pan,box_zoom,wheel_zoom,reset,save",
         toolbar_location="right",
-        title=f"quality-cut survival fraction per string, forced/pulser removed "
+        title=f"quality-cut survival fraction per string, {QC_EVENTS[events][1]} "
         f"({bin_label} bins; click a string to hide it)",
     )
     fig.yaxis.axis_label = "survival fraction"
@@ -249,13 +252,13 @@ def qc_survival_by_string(times_ms, fracs, bin_label):
     return fig
 
 
-def qc_failing_flags(rows, flags, table, counts, period):
-    """Detectors x QC flags: how often each flag fails, per physics event.
+def qc_failing_flags(rows, flags, table, counts, period, events="physics"):
+    """Detectors x QC flags: how often each flag fails, per selected event.
 
     ``rows`` is ``[(label, rawid)]`` in string order; ``table`` maps rawid to
     ``{flag: failing hits it caused}`` (see :func:`leds.validation._qc_reasons`).
     """
-    events = max(counts["events"], 1)
+    n_events = max(counts["events"], 1)
     columns = ["fails QC", *flags]
     xs, ys, frac, n = [], [], [], []
     for label, rid in rows:
@@ -265,7 +268,7 @@ def qc_failing_flags(rows, flags, table, counts, period):
             ys.append(label)
             c = row.get(col, 0)
             n.append(c)
-            frac.append(c / events if c else np.nan)
+            frac.append(c / n_events if c else np.nan)
     positive = [f for f in frac if f == f]
     mapper = LogColorMapper(
         palette=Viridis256,
@@ -284,9 +287,9 @@ def qc_failing_flags(rows, flags, table, counts, period):
         tools="hover,save",
         toolbar_location="right",
         x_axis_location="above",
-        title=f"QC flags failing, per physics event, {period} "
+        title=f"QC flags failing, per event, {period}, {QC_EVENTS[events][1]} "
         f"({counts['events']} events"
-        + (f"; delayed discharge in {dd / events:.2%}" if dd is not None else "")
+        + (f"; delayed discharge in {dd / n_events:.2%}" if dd is not None else "")
         + ")",
         tooltips=[
             ("detector", "@y"),
@@ -316,7 +319,7 @@ def _short_flag(flag):
     return flag.removeprefix("is_valid_").removeprefix("is_") if flag else "(no flag)"
 
 
-def qc_failures_by_run(per_run, names, period, n=10):
+def qc_failures_by_run(per_run, names, period, n=10, events="physics"):
     """Runs x rank: each run's ``n`` detectors failing QC most, and why.
 
     ``per_run`` is ``[(run, top)]`` with ``top`` from
@@ -364,7 +367,7 @@ def qc_failures_by_run(per_run, names, period, n=10):
         toolbar_location="right",
         x_axis_location="above",
         title=f"detectors failing QC most, per run of {period}: leading flag and "
-        "fraction of physics events",
+        f"fraction of {QC_EVENTS[events][1]}",
     )
     fig.rect(
         "x",
@@ -393,7 +396,7 @@ def qc_failures_by_run(per_run, names, period, n=10):
                 ("run", "@y"),
                 ("rank", "@x"),
                 ("detector", "@det"),
-                ("fails QC in", "@frac{0.000%} of physics events"),
+                ("fails QC in", "@frac{0.000%} of the events"),
                 ("", "@tip"),
             ]
         )

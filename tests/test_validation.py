@@ -294,6 +294,48 @@ def test_qc_flag_counts_and_names(monkeypatch):
     assert flags == ["is_empty bit 0", "is_empty bit 1"]
 
 
+def test_qc_series_for_each_event_selection():
+    n = 10
+    t = T0 + np.arange(n, dtype=float)
+    forced = np.zeros(n, dtype=bool)
+    puls = np.zeros(n, dtype=bool)
+    forced[:4] = True  # 4 forced triggers, one of them also a pulser
+    puls[3:5] = True
+    qc = np.array([True, False, True, True, True, False, True, True, True, True])
+    data = make_data({"r001": columns(t, forced=forced, puls=puls, qc=qc)})
+
+    def k(group, label):
+        return counts_of(data, "p01", "r001", (group, label))
+
+    # physics: not forced, not pulser -> events 5..9
+    assert (k("qc", "pass"), k("qc", "fail")) == (4, 1)
+    # forced without the pulser -> events 0..2
+    assert (k("qc_forced", "pass"), k("qc_forced", "fail")) == (2, 1)
+    assert (k("qc_all", "pass"), k("qc_all", "fail")) == (8, 2)
+
+
+def test_qc_flag_counts_for_each_event_selection(monkeypatch):
+    nbb = "geds/quality/is_not_bb_like"
+    raw = {
+        # events: physics, forced, pulser, forced+pulser
+        "trigger/is_forced": FakeLGDO([False, True, False, True]),
+        "coincident/puls": FakeLGDO([False, False, True, True]),
+        f"{nbb}/rawid": FakeLGDO(ak.Array([[101], [101, 201], [101], [201]])),
+        f"{nbb}/is_empty_bits": FakeLGDO(ak.Array([[0b10], [0b01, 0b10], [0], [0]])),
+    }
+    data = qc_data(monkeypatch, raw, {"is_empty_bits": ["flag_a", "flag_b"]})
+
+    physics, _ = data.period_qc_flags("p01")
+    forced, _ = data.period_qc_flags("p01", events="forced")
+    every, _ = data.period_qc_flags("p01", events="all")
+
+    assert (physics["events"], forced["events"], every["events"]) == (1, 1, 4)
+    assert physics["failing"] == {101: 1}
+    assert forced["failing"] == {101: 1, 201: 1}
+    assert every["failing"] == {101: 3, 201: 2}
+    assert forced["reasons"][101] == {"flag_b": 1}  # 0b01: flag_b unset
+
+
 def test_qc_reasons_come_from_the_closest_class(monkeypatch):
     """A positive pulse failing tail_rms is not blamed on trap_tpmin.
 
