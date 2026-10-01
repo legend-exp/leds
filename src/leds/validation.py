@@ -351,8 +351,9 @@ def qc_flag_table(counts):
 def top_failures(counts, n=10):
     """The ``n`` detectors of one run failing QC most, each with its leading flag.
 
-    Ranked by QC-failing hits per physics event. Returns ``[(rawid, failing
-    hits, fraction of physics events, leading flag, share of the detector's
+    Ranked by QC-failing hits per event of the counts' selection (see
+    ``QC_EVENTS``). Returns ``[(rawid, failing hits, fraction of those
+    events, leading flag, share of the detector's
     failing hits it caused)]``; the flag is ``None`` when the bitmasks carry
     no information. See :func:`_qc_reasons` for what counts as a cause.
     """

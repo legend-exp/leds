@@ -325,7 +325,8 @@ def qc_failures_by_run(per_run, names, period, n=10, events="physics"):
     ``per_run`` is ``[(run, top)]`` with ``top`` from
     :func:`leds.validation.top_failures`; ``names`` maps rawid to a label
     (``"s04 V01240A"``). Each cell shows the detector, its leading flag and
-    the fraction of physics events it fails QC in, coloured by that fraction.
+    the fraction of the selected ``events`` (see ``QC_EVENTS``) it fails QC
+    in, coloured by that fraction.
     """
     runs = [run for run, _ in per_run]
     ranks = [f"#{k + 1}" for k in range(n)]
