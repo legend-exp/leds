@@ -76,6 +76,8 @@ EVT_FIELDS = {
     "trigger": ("timestamp", "is_forced"),
     "coincident": ("puls", "muon", "muon_offline", "spms"),
     "geds": ("multiplicity", "rawid", "energy"),
+    # waveforms failing QC, energy or not: the forced events' per-string QC
+    "geds/quality/is_not_bb_like": ("rawid",),
 }
 EVT_NESTED = ("geds/quality/is_bb_like", "geds/psd/is_bb_like")
 
@@ -416,6 +418,9 @@ class ValidationData:
             "qc": opt("geds/quality/is_bb_like", as_bool),
             "rawid": opt("geds/rawid", lambda o: o.view_as("ak")),
             "energy": opt("geds/energy", lambda o: o.view_as("ak")),
+            "nbb_rawid": opt(
+                "geds/quality/is_not_bb_like/rawid", lambda o: o.view_as("ak")
+            ),
             "psd_bb": opt(
                 "geds/psd/is_bb_like",
                 lambda o: ak.values_astype(o.view_as("ak"), bool),
@@ -483,9 +488,11 @@ class ValidationData:
         """Every series per string, as ``(time, string)`` histograms.
 
         An event counts toward a string when it has a hit there -- for the
-        K-lines, an in-window hit there. One hit -> string lookup serves all
-        strings, instead of re-deriving every mask per string. ``None``
-        without ``geds/rawid``.
+        K-lines, an in-window hit there. Forced triggers have no energy hits,
+        so their QC series count every forced event in every string, failing
+        where a waveform of that string fails QC (``is_not_bb_like``). One
+        hit -> string lookup serves all strings, instead of re-deriving every
+        mask per string. ``None`` without ``geds/rawid``.
         """
         rawid = d.get("rawid")
         strings = sorted(string_rawids)
@@ -517,6 +524,26 @@ class ValidationData:
 
         any_hit = pairs()
         hists = {k: fill(any_hit, m) for k, m in masks.items() if k[0] not in K_LINES}
+
+        # forced triggers: every event in every string, failing per waveform
+        forced = _both(d["forced"], _not(d["puls"]))
+        nbb = d.get("nbb_rawid")
+        hists[("qc_forced", "pass")] = hists[("qc_forced", "fail")] = None
+        if forced is not None and nbb is not None and len(nbb) == len(t):
+            flat_n = ak.to_numpy(ak.flatten(nbb)).astype(np.int64)
+            pos_n = np.minimum(np.searchsorted(keys, flat_n), keys.size - 1)
+            ok = keys[pos_n] == flat_n
+            ev_n = np.repeat(np.arange(len(nbb)), ak.to_numpy(ak.num(nbb)))[ok]
+            failed = np.zeros((len(t), ns), dtype=bool)
+            failed[
+                ev_n, np.array([lut[k] for k in keys], dtype=np.int64)[pos_n[ok]]
+            ] = True
+            for label, sel in (("pass", ~failed), ("fail", failed)):
+                h = bh.Histogram(axis, bh.axis.IntCategory(strings))
+                for k, string in enumerate(strings):
+                    rows = forced & sel[:, k]
+                    h.fill(t[rows], np.full(int(rows.sum()), string))
+                hists[("qc_forced", label)] = h
         phys, cuts = cls._cuts(d)
         energy, psd = d["energy"], d["psd_bb"]
         flat_e = flat_psd = None

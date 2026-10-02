@@ -314,6 +314,31 @@ def test_qc_series_for_each_event_selection():
     assert (k("qc_all", "pass"), k("qc_all", "fail")) == (8, 2)
 
 
+def test_forced_qc_per_string_needs_no_energy_hits():
+    """Forced triggers have no energy hits; every one counts in every string."""
+    t = T0 + np.array([0.0, 600.0, 1200.0, 1800.0])
+    cols = columns(
+        t,
+        forced=np.array([True, True, True, False]),
+        puls=np.array([False, False, True, False]),  # e2: a pulser, left out
+        rawid=ak.Array([[], [], [], [101]]),  # only the physics event has a hit
+        nbb_rawid=ak.Array([[201], [], [101], []]),  # e0 fails in string 2
+    )
+    data = ValidationData(FakeViewer(runs={"p01": {"r001": ["ts"]}}))
+    data._columns = lambda _period, _run: cols  # type: ignore[method-assign]
+    data._string_map = lambda _period, _run: (  # type: ignore[method-assign]
+        {1: frozenset({101}), 2: frozenset({201})},
+        {1: 2.0, 2: 4.0},
+    )
+    strings = data._summary("p01", "r001")["strings"]
+
+    def n(string, label):
+        return strings[("qc_forced", label)][:, bh.loc(string)].sum()
+
+    assert (n(1, "pass"), n(1, "fail")) == (2, 0)  # e0, e1: string 1 is clean
+    assert (n(2, "pass"), n(2, "fail")) == (1, 1)  # e0's string-2 waveform fails
+
+
 def test_qc_flag_counts_for_each_event_selection(monkeypatch):
     nbb = "geds/quality/is_not_bb_like"
     raw = {
